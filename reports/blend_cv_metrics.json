@@ -1,0 +1,79 @@
+{
+  "tag": "blend",
+  "metric": "balanced accuracy (mean per-model recall)",
+  "C": 0.5,
+  "style_weight": 0.2,
+  "folds": 5,
+  "balanced_accuracy_nested": 0.36597066865523237,
+  "accuracy_nested": 0.36606150426083733,
+  "macro_f1_nested": 0.3451796755632626,
+  "family_accuracy_nested": 0.7072989996294924,
+  "balanced_accuracy_flat_oof": 0.35633358190405173,
+  "balanced_accuracy_soft_two_stage_oof": 0.27371116082525476,
+  "balanced_accuracy_tuned_in_sample": 0.37411633109619685,
+  "final_params": {
+    "a": 8,
+    "b": 2,
+    "c": 4,
+    "w": 0.5,
+    "mode": "linear"
+  },
+  "fold_params": [
+    {
+      "a": 8,
+      "b": 2,
+      "c": 4,
+      "w": 0.5,
+      "mode": "linear"
+    },
+    {
+      "a": 4,
+      "b": 2,
+      "c": 8,
+      "w": 0.6,
+      "mode": "geo"
+    },
+    {
+      "a": 1,
+      "b": 2,
+      "c": 4,
+      "w": 0.7,
+      "mode": "geo"
+    },
+    {
+      "a": 8,
+      "b": 2,
+      "c": 4,
+      "w": 0.5,
+      "mode": "linear"
+    },
+    {
+      "a": 8,
+      "b": 1,
+      "c": 16,
+      "w": 0.2,
+      "mode": "linear"
+    }
+  ],
+  "per_model_recall": {
+    "claude-fable-5": 0.12080536912751678,
+    "claude-opus-4-6": 0.5266666666666666,
+    "claude-opus-4-8": 0.23333333333333334,
+    "claude-opus-5": 0.62,
+    "claude-sonnet-5": 0.3466666666666667,
+    "gemini-3.1-pro-preview": 0.8133333333333334,
+    "gemini-3.6-flash": 0.44,
+    "gemini-3.7-flash": 0.37333333333333335,
+    "gemini-3.8-flash": 0.3933333333333333,
+    "glm-5.3": 0.14,
+    "glm-5.3-flash": 0.16,
+    "gpt-5.5": 0.44666666666666666,
+    "gpt-5.6-luna": 0.3,
+    "gpt-5.6-sol": 0.11333333333333333,
+    "gpt-5.6-terra": 0.21333333333333335,
+    "gpt-6-astra": 0.66,
+    "kimi-k3": 0.22,
+    "qwen3.8-max": 0.4666666666666667
+  },
+  "seconds": 68.5
+}

@@ -19,7 +19,7 @@ app = typer.Typer()
 def main(
     test_path: Path = RAW_DATA_DIR / "test.csv",
     sample_path: Path = RAW_DATA_DIR / "sample_submission.parquet",
-    model_path: Path = MODELS_DIR / "baseline.joblib",
+    model_path: Path = MODELS_DIR / "blend.joblib",
     submission_path: Path = PROCESSED_DATA_DIR / "submission.parquet",
 ):
     test = pd.read_csv(test_path)

@@ -2,10 +2,13 @@
   "tag": "baseline",
   "classifier": "svc",
   "C": 0.5,
+  "member_C": null,
   "style_weight": 0.2,
   "folds": 5,
+  "metric": "balanced accuracy (mean per-model recall)",
+  "balanced_accuracy": 0.35633358190405173,
   "accuracy": 0.356428306780289,
-  "accuracy_fold_std": 0.0070598747598434475,
+  "balanced_accuracy_fold_std": 0.006968968455735214,
   "macro_f1": 0.33488914551105214,
   "family_accuracy": 0.68506854390515,
   "within_family_accuracy": 0.5202812330989725,
@@ -29,5 +32,5 @@
     "kimi-k3": 0.2733333333333333,
     "qwen3.8-max": 0.47333333333333333
   },
-  "cv_seconds": 65.4
+  "cv_seconds": 74.2
 }

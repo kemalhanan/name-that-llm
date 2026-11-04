@@ -19,7 +19,12 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+)
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.svm import LinearSVC
@@ -119,8 +124,8 @@ def main(
         oof[va] = m.predict(X.iloc[va])
         if isinstance(m, TwoStageClassifier):
             oracle[va] = m.predict_given_family(X.iloc[va], family_of(y[va]))
-        fold_acc.append(accuracy_score(y[va], oof[va]))
-        logger.info(f"fold {k}: acc={fold_acc[-1]:.4f}")
+        fold_acc.append(balanced_accuracy_score(y[va], oof[va]))
+        logger.info(f"fold {k}: balanced acc={fold_acc[-1]:.4f}")
 
     fam_true, fam_pred = family_of(y), family_of(oof)
     metrics = {
@@ -130,8 +135,10 @@ def main(
         "member_C": member_C,
         "style_weight": style_weight,
         "folds": folds,
+        "metric": "balanced accuracy (mean per-model recall)",
+        "balanced_accuracy": balanced_accuracy_score(y, oof),
         "accuracy": accuracy_score(y, oof),
-        "accuracy_fold_std": float(np.std(fold_acc)),
+        "balanced_accuracy_fold_std": float(np.std(fold_acc)),
         "macro_f1": f1_score(y, oof, average="macro"),
         "family_accuracy": accuracy_score(fam_true, fam_pred),
         "within_family_accuracy": float(
@@ -141,9 +148,9 @@ def main(
         "cv_seconds": round(time.time() - t0, 1),
     }
     if classifier == Classifier.two_stage:
-        metrics["oracle_family_accuracy"] = accuracy_score(y, oracle)
+        metrics["oracle_family_accuracy"] = balanced_accuracy_score(y, oracle)
     logger.success(
-        f"CV accuracy {metrics['accuracy']:.4f} (±{metrics['accuracy_fold_std']:.4f}) | "
+        f"CV balanced acc {metrics['balanced_accuracy']:.4f} (±{metrics['balanced_accuracy_fold_std']:.4f}) | "
         f"macro-F1 {metrics['macro_f1']:.4f} | family acc {metrics['family_accuracy']:.4f} | "
         f"model acc given right family {metrics['within_family_accuracy']:.4f}"
         + (
@@ -164,7 +171,7 @@ def main(
         oof,
         labels,
         FIGURES_DIR / f"{tag}_confusion.png",
-        f"{tag}: grouped {folds}-fold CV, accuracy {metrics['accuracy']:.3f}",
+        f"{tag}: grouped {folds}-fold CV, balanced accuracy {metrics['balanced_accuracy']:.3f}",
     )
 
     if fit:
