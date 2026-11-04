@@ -189,3 +189,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# trained model binaries (rebuild with: uv run python -m name_that_llm.modeling.train)
+/models/*.joblib
