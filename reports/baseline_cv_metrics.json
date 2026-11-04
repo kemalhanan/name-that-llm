@@ -4,6 +4,9 @@
   "C": 0.5,
   "member_C": null,
   "style_weight": 0.2,
+  "pool_n_per_label": 0,
+  "pool_rows": 0,
+  "pool_weight": 1.0,
   "folds": 5,
   "metric": "balanced accuracy (mean per-model recall)",
   "balanced_accuracy": 0.35633358190405173,
@@ -32,5 +35,5 @@
     "kimi-k3": 0.2733333333333333,
     "qwen3.8-max": 0.47333333333333333
   },
-  "cv_seconds": 74.2
+  "cv_seconds": 72.6
 }
