@@ -33,6 +33,7 @@ from name_that_llm.config import (
     REPORTS_DIR,
 )
 from name_that_llm.features import build_features
+from name_that_llm.modeling.two_stage import TwoStageClassifier, family_of
 
 app = typer.Typer()
 
@@ -40,17 +41,25 @@ app = typer.Typer()
 class Classifier(str, Enum):
     svc = "svc"
     logreg = "logreg"
+    two_stage = "two-stage"
 
 
-def family_of(models: pd.Series | np.ndarray) -> np.ndarray:
-    return pd.Series(models).str.extract(r"^([a-z]+)", expand=False).to_numpy()
+def svc_pipeline(C: float, style_weight: float) -> Pipeline:
+    clf = LinearSVC(C=C, class_weight="balanced", max_iter=5000)
+    return Pipeline([("features", build_features(style_weight)), ("clf", clf)])
 
 
-def build_model(classifier: Classifier, C: float, style_weight: float) -> Pipeline:
+def build_model(
+    classifier: Classifier, C: float, style_weight: float, member_C: float | None = None
+):
     if classifier == Classifier.svc:
-        clf = LinearSVC(C=C, class_weight="balanced", max_iter=5000)
-    else:
-        clf = LogisticRegression(C=C, class_weight="balanced", max_iter=3000)
+        return svc_pipeline(C, style_weight)
+    if classifier == Classifier.two_stage:
+        return TwoStageClassifier(
+            family_estimator=svc_pipeline(C, style_weight),
+            member_estimator=svc_pipeline(member_C if member_C is not None else C, style_weight),
+        )
+    clf = LogisticRegression(C=C, class_weight="balanced", max_iter=3000)
     return Pipeline([("features", build_features(style_weight)), ("clf", clf)])
 
 
@@ -87,25 +96,29 @@ def main(
     classifier: Classifier = Classifier.svc,
     C: float = 0.5,
     style_weight: float = 0.2,
+    member_C: float = typer.Option(None, help="two-stage only: C of the per-family models."),
     folds: int = 5,
     fit: bool = typer.Option(True, help="Fit the final model on all data after CV."),
     tag: str = "baseline",
 ):
     train = pd.read_csv(train_path)
-    X, y, groups = train.text, train.model.to_numpy(), train.prompt_id
+    X, y, groups = train.text, train.model.to_numpy(dtype=object), train.prompt_id
     labels = sorted(np.unique(y), key=lambda m: (family_of([m])[0], m))
-    model = build_model(classifier, C, style_weight)
+    model = build_model(classifier, C, style_weight, member_C)
     logger.info(
         f"{len(train)} texts, {len(labels)} models, {groups.nunique()} prompts; "
-        f"{classifier.value} C={C} style_weight={style_weight}"
+        f"{classifier.value} C={C} member_C={member_C} style_weight={style_weight}"
     )
 
     oof = np.empty(len(train), dtype=object)
+    oracle = np.empty(len(train), dtype=object)  # two-stage: stage 2 routed by the TRUE family
     fold_acc = []
     t0 = time.time()
     for k, (tr, va) in enumerate(GroupKFold(n_splits=folds).split(X, y, groups)):
         m = clone(model).fit(X.iloc[tr], y[tr])
         oof[va] = m.predict(X.iloc[va])
+        if isinstance(m, TwoStageClassifier):
+            oracle[va] = m.predict_given_family(X.iloc[va], family_of(y[va]))
         fold_acc.append(accuracy_score(y[va], oof[va]))
         logger.info(f"fold {k}: acc={fold_acc[-1]:.4f}")
 
@@ -114,6 +127,7 @@ def main(
         "tag": tag,
         "classifier": classifier.value,
         "C": C,
+        "member_C": member_C,
         "style_weight": style_weight,
         "folds": folds,
         "accuracy": accuracy_score(y, oof),
@@ -126,10 +140,17 @@ def main(
         "per_model_recall": {m: float(np.mean(oof[y == m] == m)) for m in labels},
         "cv_seconds": round(time.time() - t0, 1),
     }
+    if classifier == Classifier.two_stage:
+        metrics["oracle_family_accuracy"] = accuracy_score(y, oracle)
     logger.success(
         f"CV accuracy {metrics['accuracy']:.4f} (±{metrics['accuracy_fold_std']:.4f}) | "
         f"macro-F1 {metrics['macro_f1']:.4f} | family acc {metrics['family_accuracy']:.4f} | "
         f"model acc given right family {metrics['within_family_accuracy']:.4f}"
+        + (
+            f" | accuracy if family were known {metrics['oracle_family_accuracy']:.4f}"
+            if "oracle_family_accuracy" in metrics
+            else ""
+        )
     )
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
