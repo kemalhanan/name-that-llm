@@ -1,0 +1,95 @@
+{
+  "passages": 540,
+  "prompts": 30,
+  "members": [
+    "lora_out",
+    "lora_out_8b"
+  ],
+  "single": {
+    "svm": 0.4444444444444444,
+    "lora_out": 0.5425925925925925,
+    "lora_out_8b": 0.5351851851851852,
+    "loras_equal": 0.5574074074074074
+  },
+  "agreement": {
+    "svm~lora_out": 0.46111111111111114,
+    "svm~lora_out_8b": 0.4425925925925926,
+    "lora_out~lora_out_8b": 0.6925925925925925
+  },
+  "blend_top10": [
+    {
+      "t_svm": 1.0,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 0.5,
+      "bal_acc": 0.5851851851851851
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 0.5,
+      "bal_acc": 0.5851851851851851
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 0.5,
+      "w_lora_out_8b": 1.0,
+      "bal_acc": 0.5851851851851851
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 0.25,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out": 0.5,
+      "w_lora_out_8b": 0.25,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 0.25,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 1.0,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 0.5,
+      "w_lora_out_8b": 0.5,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out": 1.0,
+      "w_lora_out_8b": 0.5,
+      "bal_acc": 0.5777777777777778
+    },
+    {
+      "t_svm": 0.5,
+      "w_lora_out": 0.25,
+      "w_lora_out_8b": 0.0,
+      "bal_acc": 0.575925925925926
+    }
+  ],
+  "blend_best_raw": {
+    "t_svm": 1.0,
+    "w_lora_out": 0.25,
+    "w_lora_out_8b": 0.5,
+    "bal_acc": 0.5851851851851851
+  },
+  "blend_pick": {
+    "t_svm": 2.0,
+    "w_lora_out": 0.25,
+    "w_lora_out_8b": 0.5,
+    "bal_acc": 0.5851851851851851,
+    "neighbourhood_mean": 0.5796296296296296
+  },
+  "blend_pick_sinkhorn": 0.5722222222222223
+}
