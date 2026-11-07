@@ -39,6 +39,7 @@ VARIANTS = {
         "source": "qwen-lm/qwen-3/Transformers/4b-base",
         "base": {"model_type": "qwen3", "hidden_size": 2560, "num_hidden_layers": 36},
         "pool_seed": 0,
+        "n_per_label": 2000,
         "out": "lora_out",
         "notebook": NOTEBOOK_PATH,
     },
@@ -47,8 +48,19 @@ VARIANTS = {
         "source": "qwen-lm/qwen-3/Transformers/8b-base",
         "base": {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36},
         "pool_seed": 1,
+        "n_per_label": 2000,
         "out": "lora_out_8b",
         "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_8b.ipynb",
+    },
+    # the 4B recipe with stage 1 on ~2.7x as many pool passages (references/lora-bigpool-plan.md)
+    "4b-big": {
+        "name": "Qwen3-4B-Base",
+        "source": "qwen-lm/qwen-3/Transformers/4b-base",
+        "base": {"model_type": "qwen3", "hidden_size": 2560, "num_hidden_layers": 36},
+        "pool_seed": 2,
+        "n_per_label": 5500,
+        "out": "lora_out_4b_big",
+        "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_4b_big.ipynb",
     },
 }
 
@@ -63,7 +75,8 @@ def build(mode: str, variant: str = "4b") -> nbf.NotebookNode:
             f"* **Backbone:** first 24 of 36 layers of {v['name']}, LoRA r16 / alpha 32 on all "
             "linear layers, final norm off.\n"
             "* **Head:** mean-pooled hidden states at 8 depths, a LayerNorm each, one linear layer.\n"
-            "* **Stage 1:** 1 epoch on 2,000 match-weighted Open Pool passages per model "
+            f"* **Stage 1:** 1 epoch on up to {v['n_per_label']:,} match-weighted Open Pool "
+            "passages per model "
             f"(draw seed {v['pool_seed']}). **Stage 2:** 2 epochs on train.csv.\n"
             "* **Check:** stage 2 is run once without prompt-grouped fold 0, to score that fold, "
             "and once on all of train.csv for the final checkpoint.\n\n"
@@ -113,7 +126,8 @@ def build(mode: str, variant: str = "4b") -> nbf.NotebookNode:
             "    max_len=384, bs=8,\n"
             "    stage1=dict(epochs=1, lr_lora=1e-4, lr_head=1e-3),\n"
             "    stage2=dict(epochs=2, lr_lora=5e-5, lr_head=5e-4),\n"
-            f"    n_per_label=2000, pool_seed={v['pool_seed']}, holdout_fold=0, folds=5, seed=0,\n"
+            f"    n_per_label={v['n_per_label']}, pool_seed={v['pool_seed']}, holdout_fold=0, "
+            "folds=5, seed=0,\n"
             "    base=BASE_SPEC,\n"
             ")\n"
             "if SMOKE:\n"
