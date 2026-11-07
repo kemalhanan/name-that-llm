@@ -62,6 +62,17 @@ VARIANTS = {
         "out": "lora_out_4b_big",
         "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_4b_big.ipynb",
     },
+    # the 8B on the big pool; capped at 5,000 (88k passages, ~9 h) to stay clear of the
+    # 12 h Kaggle session limit
+    "8b-big": {
+        "name": "Qwen3-8B-Base",
+        "source": "qwen-lm/qwen-3/Transformers/8b-base",
+        "base": {"model_type": "qwen3", "hidden_size": 4096, "num_hidden_layers": 36},
+        "pool_seed": 3,
+        "n_per_label": 5000,
+        "out": "lora_out_8b_big",
+        "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_8b_big.ipynb",
+    },
 }
 
 
