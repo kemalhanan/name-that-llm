@@ -1,0 +1,95 @@
+{
+  "passages": 2699,
+  "prompts": 150,
+  "members": [
+    "lora_out_4b_full",
+    "lora_out_8b_full"
+  ],
+  "single": {
+    "svm": 0.45079045488441466,
+    "lora_out_4b_full": 0.5971638081034055,
+    "lora_out_8b_full": 0.6149266716380811,
+    "loras_equal": 0.6234700472284365
+  },
+  "agreement": {
+    "svm~lora_out_4b_full": 0.46202297147091514,
+    "svm~lora_out_8b_full": 0.46832160059281214,
+    "lora_out_4b_full~lora_out_8b_full": 0.7424972211930344
+  },
+  "blend_top10": [
+    {
+      "t_svm": 0.5,
+      "w_lora_out_4b_full": 0.25,
+      "w_lora_out_8b_full": 0.5,
+      "bal_acc": 0.6308699975142928
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out_4b_full": 0.5,
+      "w_lora_out_8b_full": 1.0,
+      "bal_acc": 0.6308699975142928
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out_4b_full": 1.0,
+      "w_lora_out_8b_full": 2.0,
+      "bal_acc": 0.6308699975142928
+    },
+    {
+      "t_svm": 0.5,
+      "w_lora_out_4b_full": 0.25,
+      "w_lora_out_8b_full": 0.25,
+      "bal_acc": 0.630494655729555
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out_4b_full": 0.5,
+      "w_lora_out_8b_full": 0.5,
+      "bal_acc": 0.630494655729555
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out_4b_full": 1.0,
+      "w_lora_out_8b_full": 1.0,
+      "bal_acc": 0.630494655729555
+    },
+    {
+      "t_svm": 0.5,
+      "w_lora_out_4b_full": 0.5,
+      "w_lora_out_8b_full": 0.5,
+      "bal_acc": 0.6293910017399951
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out_4b_full": 1.0,
+      "w_lora_out_8b_full": 1.0,
+      "bal_acc": 0.6293910017399951
+    },
+    {
+      "t_svm": 2.0,
+      "w_lora_out_4b_full": 2.0,
+      "w_lora_out_8b_full": 2.0,
+      "bal_acc": 0.6293910017399951
+    },
+    {
+      "t_svm": 1.0,
+      "w_lora_out_4b_full": 0.25,
+      "w_lora_out_8b_full": 0.5,
+      "bal_acc": 0.62862043251305
+    }
+  ],
+  "blend_best_raw": {
+    "t_svm": 0.5,
+    "w_lora_out_4b_full": 0.25,
+    "w_lora_out_8b_full": 0.5,
+    "bal_acc": 0.6308699975142928
+  },
+  "blend_pick": {
+    "t_svm": 2.0,
+    "w_lora_out_4b_full": 1.0,
+    "w_lora_out_8b_full": 2.0,
+    "bal_acc": 0.6308699975142928,
+    "neighbourhood_mean": 0.6291613223962218
+  },
+  "blend_pick_sinkhorn": 0.6305045985582898
+}

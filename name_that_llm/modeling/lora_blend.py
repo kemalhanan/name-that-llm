@@ -1,9 +1,12 @@
 """Compare LoRA members with the TF-IDF SVM on their held-out prompts, and pick blend weights.
 
-Each Kaggle training notebook (kaggle_lora_train.py, MODE='full') writes
-``holdout_logits.parquet``: LoRA logits for prompt-grouped fold 0 of train.csv. The SVM's
-out-of-fold scores for the same passages come from ``train.py --tag pool2000_w1``. No model saw
-these prompts in training, so the comparison is fair.
+Each Kaggle training notebook (kaggle_lora_train.py, MODE='full') writes held-out LoRA logits:
+``holdout_logits.parquet`` covers prompt-grouped fold 0 of train.csv, and the 5-fold runs also
+write ``oof_logits.parquet`` covering every passage. The comparison uses the passages that every
+given member has held-out logits for: all 2,699 when each member comes from a 5-fold run, fold 0
+when any member only has fold 0. The SVM's out-of-fold scores (``train.py --tag pool2000_w1``)
+cover every passage with the same folds. No model saw these prompts in training, so the
+comparison is fair.
 
 The blend adds log-probabilities: ``log softmax(svm * t_svm) + sum_i w_i * log softmax(lora_i)``,
 then Sinkhorn balancing as in predict.py. With only ~540 passages single grid points are noisy, so
@@ -50,7 +53,7 @@ def neighbour_mean(grid: dict, key: tuple, step: dict) -> float:
 
 
 HOLDOUT_ARG = typer.Argument(
-    ..., help="holdout_logits.parquet of each LoRA member (all from the same fold)."
+    ..., help="holdout_logits.parquet or oof_logits.parquet of each LoRA member."
 )
 
 
@@ -68,10 +71,21 @@ def main(
     member_names = names.split(",") if names else [p.parent.name for p in holdout_paths]
     assert len(member_names) == len(holdout_paths) == len(set(member_names))
     holds = [pd.read_parquet(p) for p in holdout_paths]
+    # oof_logits.parquet: fold -1 marks a passage the run didn't score (only in timing runs)
+    holds = [h[h.fold >= 0].drop(columns="fold") if "fold" in h else h for h in holds]
     labels = [c for c in holds[0].columns if c not in ("id", "model")]
-    for h in holds[1:]:  # same passages in the same order, same label columns
-        assert list(h.columns) == list(holds[0].columns)
-        assert (h.id.to_numpy() == holds[0].id.to_numpy()).all(), "members held out other rows"
+    common = set(holds[0].id)
+    for h in holds[1:]:
+        assert list(h.columns) == list(holds[0].columns), "label columns differ between members"
+        common &= set(h.id)
+    sizes = ", ".join(f"{n} {len(h)}" for n, h in zip(member_names, holds))
+    # the passages every member has held-out logits for, in the first member's order
+    holds = [
+        h.set_index("id").loc[[i for i in holds[0].id if i in common]].reset_index() for h in holds
+    ]
+    logger.info(
+        f"{len(common)} passages held out by every member (each member holds out: {sizes})"
+    )
     oof = joblib.load(svm_scores_path)
     assert list(oof["classes"]) == labels, "label order differs between the SVM and the LoRA"
     train = pd.read_csv(train_path)
@@ -137,7 +151,7 @@ def main(
     out.write_text(json.dumps(res, indent=2))
     singles = " | ".join(f"{n} {s:.4f}" for n, s in res["single"].items())
     logger.success(
-        f"fold 0 ({res['passages']} passages): {singles} | best blend {grid[best_raw]:.4f} "
+        f"{res['passages']} passages, {res['prompts']} prompts: {singles} | best blend {grid[best_raw]:.4f} "
         f"{describe(best_raw)} | pick {grid[best]:.4f} (neighbourhood {smooth[best]:.4f}) "
         f"{describe(best)}, +Sinkhorn {res['blend_pick_sinkhorn']:.4f} -> {out}"
     )
