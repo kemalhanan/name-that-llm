@@ -1,4 +1,4 @@
-"""Two-stage LoRA training on several GPUs, with stage 2 on every prompt-grouped fold.
+"""Two-stage LoRA training on several GPUs or TPU chips, with stage 2 on every prompt-grouped fold.
 
 Run with ``torchrun --standalone --nproc_per_node=N lora_ddp.py cfg.json`` (references/
 lora-2gpu-5fold-plan.md). kaggle_lora_train.py copies this file and ``lora.py`` verbatim into the
@@ -12,9 +12,23 @@ notebook's working folder, so it imports ``lora`` as a sibling module there.
 * A batch whose fp16 loss is not finite on any GPU is skipped on all of them, so no GPU waits
   forever for another one's gradients.
 * Without a GPU it runs on CPU with the gloo backend (the local smoke test).
+
+With ``"accelerator": "tpu"`` in cfg.json, run it once as ``python lora_ddp.py cfg.json``: it starts
+one PyTorch/XLA process per TPU chip itself (``xmp.spawn``). The recipe is the same; what changes:
+
+* The trunk is bf16 and runs without autocast or loss scaling (bf16 does not overflow like fp16),
+  and gradient checkpointing is off (a TPU v5e chip has 16 GB, enough for the 8B trunk at batch 1).
+* Static shapes: every rank pads to the same length, the longest passage of the whole global
+  batch rounded up to 64 tokens, and a last batch smaller than ``bs`` is dropped. XLA then compiles
+  one training program per length (at most 6 at max_len 384) instead of one per batch.
+* Gradients are averaged with ``xm.reduce_gradients``, and the loss is read back to the host only
+  when it is logged, since every read waits for the TPU.
+* Every rank builds its model on the CPU from the same seed, a few ranks at a time so host RAM
+  holds only a few copies of the trunk at once, then moves it to its chip.
 """
 
 from datetime import timedelta
+import gc
 import json
 import math
 import os
@@ -39,6 +53,7 @@ try:  # flat files on Kaggle
         load_trunk,
         predict_logits,
         save_checkpoint,
+        static_len,
         tokenize,
     )
 except ImportError:  # inside this package
@@ -50,6 +65,7 @@ except ImportError:  # inside this package
         load_trunk,
         predict_logits,
         save_checkpoint,
+        static_len,
         tokenize,
     )
 
@@ -65,13 +81,58 @@ def sample_pool(pool: pd.DataFrame, n_per_label: int, seed: int) -> pd.DataFrame
     return pd.concat(parts, ignore_index=True)
 
 
+RANK = 0  # this process's rank, set in run()
+
+
 def log0(*args):
-    if int(os.environ.get("RANK", "0")) == 0:
+    if RANK == 0:
         print(*args, flush=True)
 
 
+class Comm:
+    """What training needs from the process group: torch.distributed (NCCL on GPU, gloo on CPU)
+    or PyTorch/XLA on TPU."""
+
+    def __init__(self, xla: bool):
+        self.xla = xla
+        if xla:
+            import torch_xla
+            import torch_xla.core.xla_model as xm
+            import torch_xla.runtime as xr
+
+            self.xm = xm
+            self.rank, self.world = xr.global_ordinal(), xr.world_size()
+            self.device = torch_xla.device() if hasattr(torch_xla, "device") else xm.xla_device()
+            self.sync = getattr(torch_xla, "sync", None) or xm.mark_step
+            self.amp = torch.bfloat16  # the trunk's dtype; no autocast on XLA
+            return
+        use_cuda = torch.cuda.is_available()
+        # a GPU waits at most 30 min for another one (rank 0 alone scores each held-out fold)
+        dist.init_process_group("nccl" if use_cuda else "gloo", timeout=timedelta(minutes=30))
+        self.rank, self.world = dist.get_rank(), dist.get_world_size()
+        if use_cuda:
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", self.rank)))
+            self.device = torch.device("cuda", torch.cuda.current_device())
+            major = torch.cuda.get_device_capability()[0]
+            self.amp = torch.bfloat16 if major >= 8 else torch.float16
+        else:
+            self.device, self.amp = torch.device("cpu"), torch.float32
+
+    def barrier(self, tag: str):
+        if self.xla:
+            self.xm.rendezvous(tag)
+        else:
+            dist.barrier()
+
+    def close(self):
+        if not self.xla:
+            dist.destroy_process_group()
+
+
 def train_stage_ddp(
-    ddp,
+    comm,
+    fwd,
+    model,
     tok,
     texts,
     y,
@@ -87,15 +148,17 @@ def train_stage_ddp(
     max_steps: int | None = None,
     log_every: int = 50,
 ):
-    """``lora.train_stage`` on several processes: same schedule, global batch ``bs``."""
-    model = ddp.module
-    rank, world = dist.get_rank(), dist.get_world_size()
+    """``lora.train_stage`` on several processes: same schedule, global batch ``bs``.
+
+    ``fwd`` is the DDP wrapper on GPU/CPU (it averages the gradients in backward) and the bare
+    model on XLA (gradients averaged by ``xm.reduce_gradients``)."""
+    rank, world, xla = comm.rank, comm.world, comm.xla
     device = model.head.weight.device
     rng = np.random.default_rng(seed)
     ids = tokenize(tok, texts, max_len)
-    y = torch.tensor(np.array(y), device=device)
-    counts = torch.bincount(y, minlength=n_classes).float()
-    class_w = (counts.sum() / (n_classes * counts.clamp(min=1))).to(device)
+    y = np.asarray(y)
+    counts = np.bincount(y, minlength=n_classes).astype(np.float32)
+    class_w = torch.tensor(counts.sum() / (n_classes * np.maximum(counts, 1)), device=device)
 
     per_epoch = math.ceil(len(ids) / bs)
     total = math.ceil(epochs * per_epoch)
@@ -117,62 +180,130 @@ def train_stage_ddp(
     )
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+    # every rank needs a share of each batch; on XLA every batch also needs the same shape
+    min_batch = bs if xla else world
+    # the steps after the first few (and, on XLA, after most compiling) give the steady s/step
+    warm_steps = min(20, total // 2)
 
-    ddp.train()
-    step, skipped, run_loss, run_n, t0 = 0, 0, 0.0, 0, time.time()
+    fwd.train()
+    step, skipped, run_n, t0, t_warm = 0, 0, 0, time.time(), None
+    run_loss = torch.zeros((), device=device) if xla else 0.0
     while step < total:
         for idx in batches(ids, bs, shuffle=True, rng=rng):  # same list on every rank
             if step >= total:
                 break
-            mine = idx[rank::world]
-            if len(mine) == 0:  # a last batch smaller than the number of GPUs: all skip it
+            if len(idx) < min_batch:  # the last batch of an epoch; the same on every rank
                 continue
-            input_ids, mask = collate(tok, ids, mine, device)
+            mine = idx[rank::world]
+            length = static_len(ids, idx, max_len) if xla else None
+            input_ids, mask = collate(tok, ids, mine, device, length)
+            target = torch.as_tensor(y[mine]).to(device)
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
-                logits = ddp(input_ids, mask)
-            loss = nn.functional.cross_entropy(logits.float(), y[mine], weight=class_w)
+                logits = fwd(input_ids, mask)
+            loss = nn.functional.cross_entropy(logits.float(), target, weight=class_w)
             opt.zero_grad(set_to_none=True)
-            ok = torch.tensor(float(torch.isfinite(loss)), device=device)
-            dist.all_reduce(ok, op=dist.ReduceOp.MIN)
-            if ok.item() < 1:
-                skipped += 1  # fp16 overflow on some GPU; every GPU drops this batch
-            else:
-                scaler.scale(loss).backward()  # DDP averages the gradients here
-                scaler.unscale_(opt)
+            if xla:
+                loss.backward()
+                comm.xm.reduce_gradients(opt)
                 torch.nn.utils.clip_grad_norm_(lora + rest, 1.0)
-                scaler.step(opt)
-                scaler.update()
-                run_loss += loss.item()
+                opt.step()
+                comm.sync()  # run this step's graph on the TPU
+                run_loss = run_loss + loss.detach()
                 run_n += 1
+            else:
+                ok = torch.tensor(float(torch.isfinite(loss)), device=device)
+                dist.all_reduce(ok, op=dist.ReduceOp.MIN)
+                if ok.item() < 1:
+                    skipped += 1  # fp16 overflow on some GPU; every GPU drops this batch
+                else:
+                    scaler.scale(loss).backward()  # DDP averages the gradients here
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(lora + rest, 1.0)
+                    scaler.step(opt)
+                    scaler.update()
+                    run_loss += loss.item()
+                    run_n += 1
             sched.step()
             step += 1
+            if step == warm_steps:
+                t_warm = time.time()
             if step % log_every == 0 or step == total:
                 el = time.time() - t0
+                mean = float(run_loss) / max(1, run_n)  # on XLA this waits for the TPU
+                extra = ""
+                if xla:
+                    import torch_xla.debug.metrics as met
+
+                    compiles = met.metric_data("CompileTime")
+                    extra = f", {compiles[0] if compiles else 0} XLA compilations"
                 log0(
-                    f"step {step}/{total} loss {run_loss / max(1, run_n):.4f} "
+                    f"step {step}/{total} loss {mean:.4f} "
                     f"{el / step:.2f}s/step, ~{el / step * (total - step) / 60:.0f} min left, "
-                    f"skipped {skipped}"
+                    f"skipped {skipped}{extra}"
                 )
-                run_loss, run_n = 0.0, 0
-    ddp.eval()
-    return {"steps": total, "skipped": skipped, "seconds": time.time() - t0}
+                run_loss = torch.zeros((), device=device) if xla else 0.0
+                run_n = 0
+    fwd.eval()
+    t_end = time.time()
+    out = {"steps": total, "skipped": skipped, "seconds": t_end - t0}
+    if t_warm is not None and total > warm_steps:
+        out["steady_s_per_step"] = (t_end - t_warm) / (total - warm_steps)
+    return out
+
+
+def build_model(comm, C: dict, n_classes: int):
+    """The classifier on this rank's device with the same initial weights on every rank, and
+    what to call for the forward pass (DDP on GPU/CPU, the bare model on XLA)."""
+    if not comm.xla:
+        torch.manual_seed(C["seed"])  # same LoRA and head init on every rank (DDP broadcasts too)
+        dtype = comm.amp if comm.device.type == "cuda" else torch.float32
+        trunk = load_trunk(C["base_dir"], C["keep"], dtype, comm.device)
+        model = LoRAClassifier(trunk, C["layers"], n_classes, C["r"], C["alpha"], C["dropout"])
+        on_gpu = comm.device.type == "cuda"
+        return model, DDP(model, device_ids=[comm.device.index] if on_gpu else None)
+    # XLA: build on the CPU (CPU RNG, so the same init everywhere), a few ranks at a time
+    wave = C.get("load_parallel", 4)
+    model = None
+    for first in range(0, comm.world, wave):
+        if first <= comm.rank < first + wave:
+            torch.manual_seed(C["seed"])
+            trunk = load_trunk(
+                C["base_dir"], C["keep"], comm.amp, "cpu", attn_implementation="eager"
+            )
+            model = LoRAClassifier(
+                trunk,
+                C["layers"],
+                n_classes,
+                C["r"],
+                C["alpha"],
+                C["dropout"],
+                ckpt=C.get("ckpt", False),
+            ).to(comm.device)
+            comm.sync()
+            gc.collect()
+        comm.barrier(f"load{first}")
+    return model, model
 
 
 def main(cfg_path: str):
     with open(cfg_path) as f:
         C = json.load(f)
-    use_cuda = torch.cuda.is_available()
-    # a GPU waits at most 30 min for another one (rank 0 alone scores each held-out fold)
-    dist.init_process_group("nccl" if use_cuda else "gloo", timeout=timedelta(minutes=30))
-    rank, world = dist.get_rank(), dist.get_world_size()
-    if use_cuda:
-        torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", rank)))
-        device = torch.device("cuda", torch.cuda.current_device())
-        amp = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+    if C.get("accelerator") == "tpu":
+        import torch_xla.distributed.xla_multiprocessing as xmp
+
+        xmp.spawn(run, args=(C,))  # one process per TPU chip
     else:
-        device, amp = torch.device("cpu"), torch.float32
+        run(None, C)
+
+
+def run(index, C: dict):
+    global RANK
+    comm = Comm(xla=C.get("accelerator") == "tpu")
+    RANK = comm.rank
+    rank, world, device, amp = comm.rank, comm.world, comm.device, comm.amp
+    use_cuda = device.type == "cuda"
     T0 = time.time()
-    log0(f"{world} processes on {device.type}, amp {amp}, mode {C['mode']}")
+    log0(f"{world} processes on {device.type}, dtype {amp}, mode {C['mode']}")
 
     train = pd.read_csv(f"{C['comp']}/train.csv")
     pool = pd.read_parquet(C["pool"], columns=["text", "model", "match_weight"])
@@ -188,11 +319,8 @@ def main(cfg_path: str):
     folds = list(GroupKFold(n_splits=C["folds"]).split(train, y_train, train.prompt_id))
     log0(f"train {len(train)} in {C['folds']} folds, pool sample {len(pool_sample)}")
 
-    torch.manual_seed(C["seed"])  # same LoRA and head init on every rank (DDP broadcasts it too)
     tok = load_tokenizer(C["base_dir"])
-    trunk = load_trunk(C["base_dir"], C["keep"], amp if use_cuda else torch.float32, device)
-    model = LoRAClassifier(trunk, C["layers"], len(labels), C["r"], C["alpha"], C["dropout"])
-    ddp = DDP(model, device_ids=[device.index] if use_cuda else None)
+    model, fwd = build_model(comm, C, len(labels))
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log0(
         f"{model.n_lora} LoRA layers, {n_train / 1e6:.1f}M trainable, loaded in "
@@ -205,7 +333,9 @@ def main(cfg_path: str):
         torch.cuda.reset_peak_memory_stats()
     timing = C["mode"] == "timing"
     s1 = train_stage_ddp(
-        ddp,
+        comm,
+        fwd,
+        model,
         tok,
         pool_sample.text,
         y_pool,
@@ -218,8 +348,14 @@ def main(cfg_path: str):
     log0("stage 1:", s1)
     if use_cuda:
         log0(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+    if comm.xla and rank == 0:
+        try:
+            log0(f"TPU memory: {comm.xm.get_memory_info(device)}")
+        except Exception as e:  # noqa: BLE001  (API differs between torch_xla versions)
+            log0(f"TPU memory: not available ({e})")
     if timing:
-        per_step = s1["seconds"] / s1["steps"]
+        per_step = s1.get("steady_s_per_step", s1["seconds"] / s1["steps"])
+        log0(f"steady {per_step:.2f}s/step (after the first steps and compiles)")
         bs = C["bs"]
         steps = {"stage 1": -(-len(pool_sample) // bs)}
         steps["stage 2, 5 folds"] = sum(2 * -(-len(f) // bs) for f, _ in folds)
@@ -246,7 +382,9 @@ def main(cfg_path: str):
             hold_idx = hold_idx[:48]
         model.load_state_dict({n: v.to(device) for n, v in stage1_state.items()}, strict=False)
         s2 = train_stage_ddp(
-            ddp,
+            comm,
+            fwd,
+            model,
             tok,
             train.text.iloc[fit_idx],
             y_train[fit_idx],
@@ -264,6 +402,7 @@ def main(cfg_path: str):
                 bs=2 * C["bs"],
                 max_len=C["max_len"],
                 amp_dtype=amp,
+                static=comm.xla,
             )
             oof[hold_idx], fold_of[hold_idx] = z, k
             bacc = balanced_accuracy_score(y_train[hold_idx], z.argmax(1))
@@ -277,11 +416,13 @@ def main(cfg_path: str):
                 f"fold {k}: balanced accuracy {bacc:.4f} ({len(hold_idx)} passages) "
                 f"after {(time.time() - T0) / 60:.0f} min"
             )
-        dist.barrier()
+        comm.barrier(f"fold{k}")
 
     model.load_state_dict({n: v.to(device) for n, v in stage1_state.items()}, strict=False)
     s2_all = train_stage_ddp(
-        ddp,
+        comm,
+        fwd,
+        model,
         tok,
         train.text,
         y_train,
@@ -314,8 +455,8 @@ def main(cfg_path: str):
             f"per fold {[round(f['balanced_accuracy'], 4) for f in meta['folds']]}"
         )
         log0(f"saved to {out} in {(time.time() - T0) / 60:.1f} min")
-    dist.barrier()
-    dist.destroy_process_group()
+    comm.barrier("done")
+    comm.close()
 
 
 if __name__ == "__main__":

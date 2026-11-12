@@ -20,6 +20,7 @@ few hundred passages on CPU, which checks the code end to end in a couple of min
 
 import inspect
 from pathlib import Path
+import textwrap
 
 import nbformat as nbf
 import typer
@@ -97,6 +98,30 @@ VARIANTS = {
         "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_8b_full.ipynb",
         "ddp": True,
     },
+    # a third family for the blend (references/lora-third-member-plan.md): first 24 of Llama's 32
+    # layers; ~1.13x the 8B's cost per step, so capped at 8,000 (~128k passages, ~9 h)
+    "llama8b-full": {
+        "name": "Llama-3.1-8B",
+        "source": "metaresearch/llama-3.1/Transformers/8b",
+        "base": {"model_type": "llama", "hidden_size": 4096, "num_hidden_layers": 32},
+        "pool_seed": 6,
+        "n_per_label": 8000,
+        "out": "lora_out_llama8b_full",
+        "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_llama8b_full.ipynb",
+        "ddp": True,
+    },
+    # the same plan on Mistral-7B, whose Kaggle copy needs no license request: 24 of 32 layers,
+    # the Llama layer sizes but a 32k vocabulary (~15% more tokens per passage), same cap
+    "mistral7b-full": {
+        "name": "Mistral-7B-v0.1",
+        "source": "mistral-ai/mistral/PyTorch/7b-v0.1-hf",
+        "base": {"model_type": "mistral", "hidden_size": 4096, "num_hidden_layers": 32},
+        "pool_seed": 6,
+        "n_per_label": 8000,
+        "out": "lora_out_mistral7b_full",
+        "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_mistral7b_full.ipynb",
+        "ddp": True,
+    },
 }
 
 # Starts one training process per GPU (what torchrun does, without its launcher, which needs
@@ -146,30 +171,88 @@ assert codes == [0] * n_proc, f'training processes exited with {codes}'
 """
 
 
-def build_ddp(mode: str, variant: str) -> nbf.NotebookNode:
-    """The multi-GPU, 5-fold training notebook: writes lora.py and lora_ddp.py next to it and
-    runs one training process per GPU."""
+# Kaggle's TPU image may lack PyTorch/XLA or transformers; the training notebook may use the
+# internet (only submission notebooks run offline), so install what is missing. torch_xla must
+# match the installed torch version.
+TPU_SETUP_CODE = """\
+import importlib.metadata as md
+import importlib.util
+import os
+import subprocess
+import sys
+
+
+def pip(*args):
+    return subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', *args]).returncode == 0
+
+
+# versions only, nothing imported: the training processes start fresh and open the TPU themselves
+if os.path.exists('/kaggle/input'):
+    if importlib.util.find_spec('torch_xla') is None:
+        have = md.version('torch').split('+')[0] if importlib.util.find_spec('torch') else None
+        # torch_xla for the installed torch, else a known torch + torch_xla pair
+        if not (have and pip(f'torch_xla[tpu]=={have}')):
+            assert pip('torch==2.7.0', 'torch_xla[tpu]==2.7.0'), 'could not install torch_xla'
+    for module, package in [('transformers', 'transformers'), ('safetensors', 'safetensors'),
+                            ('sklearn', 'scikit-learn'), ('pyarrow', 'pyarrow')]:
+        if importlib.util.find_spec(module) is None:
+            assert pip(package), f'could not install {package}'
+    print({p: md.version(p) for p in ['torch', 'torch_xla', 'transformers']})
+"""
+
+# One process here; lora_ddp.py starts one process per TPU chip itself (xmp.spawn). This notebook
+# process must not touch the TPU, or the training processes cannot open it.
+TPU_LAUNCH_CODE = """\
+import subprocess
+import sys
+
+env = dict(os.environ, PJRT_DEVICE='TPU', PYTHONUNBUFFERED='1', TOKENIZERS_PARALLELISM='false')
+proc = subprocess.Popen([sys.executable, 'lora_ddp.py', 'cfg.json'], env=env,
+                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+for line in proc.stdout:
+    if 'UNEXPECTED' not in line:  # skip the per-layer load report of the cut-down model
+        print(line, end='', flush=True)
+assert proc.wait() == 0, f'training exited with {proc.returncode}'
+"""
+
+
+def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
+    """The multi-GPU (or TPU), 5-fold training notebook: writes lora.py and lora_ddp.py next to
+    it and runs one training process per GPU (or TPU chip)."""
     v = VARIANTS[variant]
+    out = v["out"] + ("_tpu" if tpu else "")
     md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
+    where = "TPU v5e-8" if tpu else "both GPUs"
+    if tpu:
+        needs = (
+            "Needs **TPU VM v5e-8** and **internet on** (to install PyTorch/XLA if the image "
+            "lacks it), and three inputs: the competition data, "
+        )
+        parallel = "data-parallel on the 8 TPU chips (bf16, static shapes)"
+    else:
+        needs = "Needs **GPU T4 x2**, internet off, and three inputs: the competition data, "
+        parallel = "data-parallel on every GPU"
     cells = [
         md(
-            f"# Name That LLM: two-stage LoRA classifier on {v['name']}, both GPUs, 5 folds "
+            f"# Name That LLM: two-stage LoRA classifier on {v['name']}, {where}, 5 folds "
             "(training)\n\n"
             "Generated by `name_that_llm/kaggle_lora_train.py`; do not edit by hand.\n\n"
-            f"* **Backbone:** first 24 of 36 layers of {v['name']}, LoRA r16 / alpha 32 on all "
+            f"* **Backbone:** first 24 of {v['base']['num_hidden_layers']} layers of {v['name']}, "
+            "LoRA r16 / alpha 32 on all "
             "linear layers, final norm off.\n"
             "* **Head:** mean-pooled hidden states at 8 depths, a LayerNorm each, one linear layer.\n"
             f"* **Stage 1:** 1 epoch on up to {v['n_per_label']:,} match-weighted Open Pool "
-            f"passages per model (draw seed {v['pool_seed']}), data-parallel on every GPU with "
+            f"passages per model (draw seed {v['pool_seed']}), {parallel} with "
             "the same global batch of 8. **Stage 2:** 2 epochs on train.csv.\n"
             "* **Folds:** from the stage-1 weights, stage 2 runs once per prompt-grouped fold "
             "(5) leaving it out and scoring it, then once on all of train.csv. Outputs: "
             "`oof_logits.parquet` for every training passage, `fold0..4/`, `stage1/`, and the "
             "full fit at the top of the folder.\n\n"
-            "Needs **GPU T4 x2**, internet off, and three inputs: the competition data, "
-            f"`crtproduction/name-that-llm-open-pool` and `{v['source']}`.\n\n"
+            + needs
+            + f"`crtproduction/name-that-llm-open-pool` and `{v['source']}`.\n\n"
             "To switch between the timing run and the full run, change `MODE` in the next cell."
         ),
+        *([code(TPU_SETUP_CODE)] if tpu else []),
         code(
             "import glob\nimport json\nimport os\nimport time\n\nimport torch\n\n"
             f"MODE = {mode!r}  # 'timing' or 'full'\n"
@@ -194,10 +277,16 @@ def build_ddp(mode: str, variant: str) -> nbf.NotebookNode:
             "    assert comps, f'Attach the name-that-llm competition data; found {attached}'\n"
             "    pools = glob.glob('/kaggle/input/**/ntl_open_pool.parquet', recursive=True)\n"
             "    assert pools, f'Attach crtproduction/name-that-llm-open-pool; found {attached}'\n"
-            "    assert torch.cuda.device_count() >= 2, "
-            "'pick the GPU T4 x2 accelerator for this notebook'\n"
-            "    paths = dict(comp=comps[0], pool=pools[0], base_dir=find_base(BASE_SPEC), "
-            f"out={v['out']!r})\n"
+            + (
+                "    # the TPU chips show up as device files (not opened here, see the launch)\n"
+                "    assert glob.glob('/dev/vfio/[0-9]*') or glob.glob('/dev/accel*'), "
+                "'pick the TPU VM v5e-8 accelerator for this notebook'\n"
+                if tpu
+                else "    assert torch.cuda.device_count() >= 2, "
+                "'pick the GPU T4 x2 accelerator for this notebook'\n"
+            )
+            + "    paths = dict(comp=comps[0], pool=pools[0], base_dir=find_base(BASE_SPEC), "
+            f"out={out!r})\n"
             "    SMOKE = False\n"
             "else:  # smoke test from this project's notebooks/ folder, 2 CPU processes\n"
             "    paths = dict(comp='../data/raw', "
@@ -212,25 +301,52 @@ def build_ddp(mode: str, variant: str) -> nbf.NotebookNode:
             "    stage1=dict(epochs=1, lr_lora=1e-4, lr_head=1e-3),\n"
             "    stage2=dict(epochs=2, lr_lora=5e-5, lr_head=5e-4),\n"
             f"    n_per_label={v['n_per_label']}, pool_seed={v['pool_seed']}, folds=5, seed=0,\n"
-            "    timing_steps=60, base=BASE_SPEC, mode=MODE, smoke=SMOKE, **paths,\n"
-            ")\n"
+            f"    timing_steps={150 if tpu else 60}, base=BASE_SPEC, mode=MODE, smoke=SMOKE, "
+            "**paths,\n"
+            + (
+                "    # TPU: bf16, no gradient checkpointing, 4 ranks load the trunk at a time\n"
+                "    accelerator='tpu' if ON_KAGGLE else 'cpu', ckpt=False, load_parallel=4,\n"
+                if tpu
+                else ""
+            )
+            + ")\n"
             "if SMOKE:\n"
             "    CFG.update(keep=2, layers=[1, 2], max_len=64, bs=4, n_per_label=10)\n"
             "with open('cfg.json', 'w') as f:\n"
             "    json.dump(CFG, f, indent=1)\n"
-            "print('mode', MODE, '| GPUs', torch.cuda.device_count(), '| base model', "
-            "paths['base_dir'])"
+            + (
+                "print('mode', MODE, '| accelerator', CFG['accelerator'], '| base model', "
+                "paths['base_dir'])"
+                if tpu
+                else "print('mode', MODE, '| GPUs', torch.cuda.device_count(), '| base model', "
+                "paths['base_dir'])"
+            )
         ),
         md("## Training code (copied from `name_that_llm/lora.py` and `lora_ddp.py`)"),
         code("%%writefile lora.py\n" + inspect.getsource(lora)),
         code("%%writefile lora_ddp.py\n" + inspect.getsource(lora_ddp)),
         md(
-            "## Train: one process per GPU\n\n"
-            "In `timing` mode stage 1 runs only 60 steps and prints a forecast for a full run; "
+            f"## Train: one process per {'TPU chip' if tpu else 'GPU'}\n\n"
+            f"In `timing` mode stage 1 runs only {150 if tpu else 60} steps and prints a "
+            "forecast for a full run; "
             "then every later step runs briefly (10 stage-2 steps per fold, 48 held-out "
             "passages scored per fold), so a bug there shows up in minutes, not hours."
+            + (
+                " The first steps of each new sequence length are slow while XLA compiles; "
+                "the forecast uses the steps after the first 20."
+                if tpu
+                else ""
+            )
         ),
-        code(DDP_LAUNCH_CODE),
+        code(
+            # off Kaggle the TPU notebook runs the CPU smoke test through the DDP launcher
+            "if CFG.get('accelerator') == 'tpu':\n"
+            + textwrap.indent(TPU_LAUNCH_CODE, "    ")
+            + "else:\n"
+            + textwrap.indent(DDP_LAUNCH_CODE, "    ")
+            if tpu
+            else DDP_LAUNCH_CODE
+        ),
         md("## Summary"),
         code(
             "for f in ['lora.py', 'lora_ddp.py', 'cfg.json'] + glob.glob('rank*.log'):\n"
@@ -255,16 +371,19 @@ def build_ddp(mode: str, variant: str) -> nbf.NotebookNode:
     )
 
 
-def build(mode: str, variant: str = "4b") -> nbf.NotebookNode:
+def build(mode: str, variant: str = "4b", tpu: bool = False) -> nbf.NotebookNode:
     v = VARIANTS[variant]
     if v.get("ddp"):
-        return build_ddp(mode, variant)
+        return build_ddp(mode, variant, tpu)
+    if tpu:
+        raise ValueError(f"variant {variant} is single-GPU; --tpu needs a multi-process variant")
     md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
     cells = [
         md(
             f"# Name That LLM: two-stage LoRA classifier on {v['name']} (training)\n\n"
             "Generated by `name_that_llm/kaggle_lora_train.py`; do not edit by hand.\n\n"
-            f"* **Backbone:** first 24 of 36 layers of {v['name']}, LoRA r16 / alpha 32 on all "
+            f"* **Backbone:** first 24 of {v['base']['num_hidden_layers']} layers of {v['name']}, "
+            "LoRA r16 / alpha 32 on all "
             "linear layers, final norm off.\n"
             "* **Head:** mean-pooled hidden states at 8 depths, a LayerNorm each, one linear layer.\n"
             f"* **Stage 1:** 1 epoch on up to {v['n_per_label']:,} match-weighted Open Pool "
@@ -442,36 +561,61 @@ def main(
     mode: str = "timing",
     variant: str = typer.Option("4b", help=f"Ensemble member: {', '.join(VARIANTS)}."),
     path: Path | None = None,  # default: the variant's own notebook
+    tpu: bool = typer.Option(False, help="Train on a Kaggle TPU v5e-8 (multi-process variants)."),
 ):
     if mode not in ("timing", "full"):
         raise typer.BadParameter("mode is 'timing' or 'full'")
     if variant not in VARIANTS:
         raise typer.BadParameter(f"variant is one of {', '.join(VARIANTS)}")
     path = path or VARIANTS[variant]["notebook"]
-    nbf.write(build(mode, variant), path)
-    print(f"wrote {path} (variant={variant}, MODE={mode!r})")
+    if tpu and path == VARIANTS[variant]["notebook"]:
+        path = path.with_name(path.stem + "_tpu.ipynb")
+    nbf.write(build(mode, variant, tpu), path)
+    print(f"wrote {path} (variant={variant}, MODE={mode!r}, tpu={tpu})")
 
 
 @app.command()
-def smoke_model(out: Path = PROJ_ROOT / "data" / "interim" / "tiny_qwen3"):
-    """A tiny random Qwen3 with the real Qwen3 tokenizer, for the local smoke test."""
+def smoke_model(
+    out: Path | None = None,
+    arch: str = typer.Option(
+        "qwen3", help="qwen3, or llama / mistral (tiny models with a BOS token)."
+    ),
+):
+    """A tiny random model with the real Qwen3 tokenizer, for the local smoke test. The llama
+    one gets a BOS token, as Llama's tokenizer has, so the BOS path is tested too."""
     from huggingface_hub import snapshot_download
-    from transformers import AutoTokenizer, Qwen3Config, Qwen3Model
+    from transformers import (
+        AutoTokenizer,
+        LlamaConfig,
+        LlamaModel,
+        MistralConfig,
+        MistralModel,
+        Qwen3Config,
+        Qwen3Model,
+    )
 
+    out = out or PROJ_ROOT / "data" / "interim" / f"tiny_{arch}"
     tok_dir = snapshot_download(
         "Qwen/Qwen3-4B-Base", allow_patterns=["tokenizer*", "vocab.json", "merges.txt"]
     )
     tok = AutoTokenizer.from_pretrained(tok_dir)
-    cfg = Qwen3Config(
-        vocab_size=len(tok),
-        hidden_size=64,
-        intermediate_size=128,
-        num_hidden_layers=4,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        head_dim=16,
-    )
-    Qwen3Model(cfg).save_pretrained(out)
+    small = {
+        "vocab_size": len(tok),
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+    }
+    if arch in ("llama", "mistral"):
+        tok.bos_token = "<|im_start|>"  # stands in for <|begin_of_text|> / <s>
+        config, model = (
+            (LlamaConfig, LlamaModel) if arch == "llama" else (MistralConfig, MistralModel)
+        )
+        model(config(**small, bos_token_id=tok.bos_token_id)).save_pretrained(out)
+    else:
+        Qwen3Model(Qwen3Config(**small)).save_pretrained(out)
     tok.save_pretrained(out)
     print(f"wrote {out}")
 

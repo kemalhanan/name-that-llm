@@ -50,6 +50,7 @@ force-sort-within-sections = true
 [dependency-groups]
 lora = [
     "huggingface-hub>=2.4.0",
+    "kagglehub>=1.0.3",
     "safetensors>=0.8.0",
     "torch>=2.15.0",
     "transformers>=5.22.1",

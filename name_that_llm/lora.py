@@ -9,8 +9,12 @@ verbatim into a Kaggle notebook. See references/lora-plan.md for the recipe and 
   through its own LayerNorm, concatenated, then one linear layer to the classes.
 * Training runs in fp16 autocast with loss scaling on T4s (no bf16 there); batches whose loss is
   not finite are skipped and counted.
+* On TPU (PyTorch/XLA, see lora_ddp.py) the trunk is stored in bf16 and runs without autocast,
+  and every batch is padded to a fixed set of shapes (``static=True``), because XLA compiles a new
+  program for every new tensor shape.
 """
 
+import contextlib
 import json
 import math
 import os
@@ -55,16 +59,26 @@ def add_lora(model: nn.Module, r: int, alpha: float, dropout: float) -> int:
     return len(targets)
 
 
-def load_trunk(base_dir: str, keep: int, dtype, device) -> nn.Module:
+def load_trunk(base_dir: str, keep: int, dtype, device, attn_implementation=None) -> nn.Module:
     """The first ``keep`` decoder layers of the base model, frozen, final norm switched off."""
     cfg = AutoConfig.from_pretrained(base_dir)
     cfg.num_hidden_layers, cfg.use_cache = keep, False
     if getattr(cfg, "layer_types", None) is not None:
         cfg.layer_types = cfg.layer_types[:keep]
-    trunk = AutoModel.from_pretrained(base_dir, config=cfg, dtype=dtype).to(device)
+    kw = {"attn_implementation": attn_implementation} if attn_implementation else {}
+    trunk = AutoModel.from_pretrained(base_dir, config=cfg, dtype=dtype, **kw)
+    # .to(dtype) too: transformers before 4.56 ignores ``dtype=`` and would load fp32
+    trunk = trunk.to(device=device, dtype=dtype)
     trunk.norm = nn.Identity()
     trunk.requires_grad_(False)
     return trunk
+
+
+def no_autocast(device_type: str):
+    """Autocast switched off (the head runs in fp32); XLA runs without autocast anyway."""
+    if device_type in ("cuda", "cpu"):
+        return torch.autocast(device_type=device_type, enabled=False)
+    return contextlib.nullcontext()
 
 
 class LoRAClassifier(nn.Module):
@@ -90,7 +104,7 @@ class LoRAClassifier(nn.Module):
         m = attention_mask.unsqueeze(-1).float()
         m[:, 0] = 0  # the first token is an attention sink; leave it out of the mean
         den = m.sum(1).clamp(min=1)
-        with torch.autocast(device_type=input_ids.device.type, enabled=False):
+        with no_autocast(input_ids.device.type):
             z = torch.cat(
                 [nm((hs[l].float() * m).sum(1) / den) for l, nm in zip(self.layers, self.norms)],
                 -1,
@@ -103,8 +117,16 @@ class LoRAClassifier(nn.Module):
 
 
 def tokenize(tok, texts, max_len: int) -> list[list[int]]:
-    ids = tok(list(texts), add_special_tokens=False, truncation=True, max_length=max_len - 1)
-    return [x + [tok.eos_token_id] for x in ids["input_ids"]]
+    """Token ids of each passage, ending in EOS, and starting with BOS if the tokenizer has one
+    (Llama does; Qwen has none, so Qwen ids are just the text and EOS). At most ``max_len``."""
+    bos = [] if tok.bos_token_id is None else [tok.bos_token_id]
+    ids = tok(
+        list(texts),
+        add_special_tokens=False,
+        truncation=True,
+        max_length=max_len - 1 - len(bos),
+    )
+    return [bos + x + [tok.eos_token_id] for x in ids["input_ids"]]
 
 
 def batches(ids, bs: int, shuffle: bool, rng=None):
@@ -126,8 +148,23 @@ def batches(ids, bs: int, shuffle: bool, rng=None):
     return out
 
 
-def collate(tok, ids, idx, device):
-    enc = tok.pad({"input_ids": [ids[i] for i in idx]}, return_tensors="pt")
+PAD_MULTIPLE = 64  # static shapes: sequence lengths are rounded up to a multiple of this
+
+
+def static_len(ids, idx, max_len: int) -> int:
+    """The padded length for a batch: its longest passage rounded up to ``PAD_MULTIPLE``, so XLA
+    sees at most ``max_len / PAD_MULTIPLE`` sequence lengths."""
+    longest = max(len(ids[i]) for i in idx)
+    return min(max_len, -(-longest // PAD_MULTIPLE) * PAD_MULTIPLE)
+
+
+def collate(tok, ids, idx, device, length: int | None = None):
+    """Pad a batch to its longest passage, or to ``length`` (static shapes for XLA)."""
+    feats = {"input_ids": [ids[i] for i in idx]}
+    if length is None:
+        enc = tok.pad(feats, return_tensors="pt")
+    else:
+        enc = tok.pad(feats, padding="max_length", max_length=length, return_tensors="pt")
     return enc["input_ids"].to(device), enc["attention_mask"].to(device)
 
 
@@ -214,17 +251,25 @@ def train_stage(
 
 
 @torch.no_grad()
-def predict_logits(model, tok, texts, *, bs: int, max_len: int, amp_dtype) -> np.ndarray:
+def predict_logits(
+    model, tok, texts, *, bs: int, max_len: int, amp_dtype, static: bool = False
+) -> np.ndarray:
+    """Logits for ``texts``. ``static=True`` (XLA) pads every batch to ``bs`` rows and a length
+    from ``static_len``; the padding rows are dropped again."""
     device = model.head.weight.device
     ids = tokenize(tok, texts, max_len)
     out = np.zeros((len(ids), model.head.out_features), np.float32)
     model.eval()
     for idx in batches(ids, bs, shuffle=False):
-        input_ids, mask = collate(tok, ids, idx, device)
+        rows = idx
+        if static and len(idx) < bs:
+            rows = np.concatenate([idx, np.repeat(idx[-1:], bs - len(idx))])
+        length = static_len(ids, rows, max_len) if static else None
+        input_ids, mask = collate(tok, ids, rows, device, length)
         with torch.autocast(
             device_type=device.type, dtype=amp_dtype, enabled=device.type == "cuda"
         ):
-            out[idx] = model(input_ids, mask).float().cpu().numpy()
+            out[idx] = model(input_ids, mask).float().cpu().numpy()[: len(idx)]
     return out
 
 

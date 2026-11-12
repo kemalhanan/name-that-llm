@@ -63,6 +63,18 @@ uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lor
 
 - **Training notebook:** set `MODE = "timing"` for a 15-minute speed check, or `"full"` for the real run (about 9 h for the 8B). It needs the competition data, the Open Pool and the Qwen3 base model as inputs.
 - **Submission notebook:** needs the training runs' outputs attached as inputs.
+- **TPU:** add `--tpu` to build a training notebook for Kaggle's TPU v5e-8 instead of the two T4s, for example `kaggle_lora_train_4b_full_tpu.ipynb`. It trains in bf16 with fixed tensor shapes and writes the same outputs to a folder ending in `_tpu`. It needs internet on, so it can install PyTorch/XLA if the image lacks it.
+- **Off Kaggle:** `name_that_llm/remote_train.py` runs the same training on any CUDA machine, such as a rented A100 or H100, without using Kaggle GPU quota. It trains in bf16 on those GPUs and keeps the global batch at 8. Upload the output as a private dataset and attach it to the submission notebook:
+
+  ```bash
+  uv sync --group lora
+  uv run python -m name_that_llm.remote_train fetch mistral7b-full
+  uv run python -m name_that_llm.remote_train run mistral7b-full --mode timing
+  uv run python -m name_that_llm.remote_train run mistral7b-full --mode full
+  uv run python -m name_that_llm.remote_train package mistral7b-full --user <kaggle user>
+  ```
+
+  `fetch` needs Kaggle credentials (`KAGGLE_USERNAME` and `KAGGLE_KEY`, or `~/.kaggle/kaggle.json`). Outputs go to `data/remote/out/`.
 
 Each training run writes held-out logits. Compare and blend them with:
 
