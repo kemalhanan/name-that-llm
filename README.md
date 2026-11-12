@@ -75,6 +75,7 @@ uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lor
   ```
 
   `fetch` needs Kaggle credentials (`KAGGLE_USERNAME` and `KAGGLE_KEY`, or `~/.kaggle/kaggle.json`). Outputs go to `data/remote/out/`.
+- **Colab:** [notebooks/colab_lora_train_mistral7b_full.ipynb](notebooks/colab_lora_train_mistral7b_full.ipynb) runs those steps on a Colab A100 and saves the full run to Google Drive ([open in Colab](https://colab.research.google.com/github/kemalhanan/name-that-llm/blob/main/notebooks/colab_lora_train_mistral7b_full.ipynb)). Build it for another variant with `uv run python -m name_that_llm.remote_train colab <variant>`.
 
 Each training run writes held-out logits. Compare and blend them with:
 
