@@ -6,7 +6,7 @@ On the GPU machine (Linux, Python 3.12, uv)::
 
     git clone https://github.com/kemalhanan/name-that-llm.git && cd name-that-llm
     uv sync --group lora
-    export KAGGLE_USERNAME=... KAGGLE_KEY=...          # or ~/.kaggle/kaggle.json
+    export KAGGLE_API_TOKEN=...   # or the legacy KAGGLE_USERNAME + KAGGLE_KEY
     uv run python -m name_that_llm.remote_train fetch mistral7b-full
     uv run python -m name_that_llm.remote_train run mistral7b-full --mode timing   # ~10 min
     uv run python -m name_that_llm.remote_train run mistral7b-full --mode full
@@ -231,7 +231,8 @@ def colab_cells(variant: str) -> list:
             "**Before running:**\n"
             "1. **Runtime → Change runtime type → A100 GPU** (an L4 works, at about the speed of "
             "Kaggle's two T4s).\n"
-            "2. **Secrets** (key icon on the left): add `KAGGLE_USERNAME` and `KAGGLE_KEY` and "
+            "2. **Secrets** (key icon on the left): add `KAGGLE_API_TOKEN` (a token from "
+            "kaggle.com/settings → API Tokens; or the legacy `KAGGLE_USERNAME` and `KAGGLE_KEY`) and "
             "give this notebook access. You must have joined the competition on Kaggle.\n"
             "3. Run the timing run first (`MODE = 'timing'`, ~10 min), check its s/step, then "
             "set `MODE = 'full'` and run all again.\n\n"
@@ -254,8 +255,12 @@ def colab_cells(variant: str) -> list:
             "'--format=csv'],\n"
             "                     capture_output=True, text=True).stdout)\n"
             "drive.mount('/content/drive')\n"
-            "os.environ['KAGGLE_USERNAME'] = userdata.get('KAGGLE_USERNAME')\n"
-            "os.environ['KAGGLE_KEY'] = userdata.get('KAGGLE_KEY')"
+            "# a new-style API token (KGAT_...); else the legacy username + key pair\n"
+            "try:\n"
+            "    os.environ['KAGGLE_API_TOKEN'] = userdata.get('KAGGLE_API_TOKEN').strip()\n"
+            "except userdata.SecretNotFoundError:\n"
+            "    os.environ['KAGGLE_USERNAME'] = userdata.get('KAGGLE_USERNAME')\n"
+            "    os.environ['KAGGLE_KEY'] = userdata.get('KAGGLE_KEY')"
         ),
         code(
             "%cd /content\n"
