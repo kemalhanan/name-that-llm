@@ -19,6 +19,21 @@ Outputs go to data/remote/out/ (git ignores data/).
 starts one training process per GPU (lora_ddp.py). The global batch stays 8 whatever the number of
 GPUs, so the recipe matches the Kaggle-trained members. On an A100, H100 or L4 the trunk trains in
 bf16 instead of the T4s' fp16 (lora_ddp.Comm picks it from the GPU).
+
+On a machine that can go away mid-run (Colab), keep the run's progress on Kaggle and resume it::
+
+    uv run python -m name_that_llm.remote_train restore mistral7b-full --user <kaggle user>
+    uv run python -m name_that_llm.remote_train sync mistral7b-full --user <kaggle user> &
+    uv run python -m name_that_llm.remote_train run mistral7b-full --mode full --resume
+    uv run python -m name_that_llm.remote_train sync mistral7b-full --user <kaggle user> --once
+
+``run`` saves stage 1 every ``--save-every-min`` minutes and each fold as it finishes; ``sync``
+uploads the output folder as a new version of the private dataset whenever it has changed;
+``restore`` downloads the latest version into the output folder, and ``run --resume`` then carries
+on from it instead of starting over. ``unattended`` does those four steps in one command that is
+safe to start again at any time; ``scripts/colab/`` starts it on a Colab runtime with no browser
+tab (push.py copies this working tree and the Kaggle credential there, ensure.sh starts or
+reports the run). Nothing is written to Google Drive.
 """
 
 import glob
@@ -57,7 +72,9 @@ def find_base(root: str, spec: dict) -> str:
     raise FileNotFoundError(f"no base model {spec} under {root}; run fetch first")
 
 
-def train_cfg(variant: str, mode: str, paths: dict, smoke: bool = False) -> dict:
+def train_cfg(
+    variant: str, mode: str, paths: dict, smoke: bool = False, save_every_min: float = 0
+) -> dict:
     """The training notebook's CFG (kaggle_lora_train.build_ddp); keep the two in step."""
     v = VARIANTS[variant]
     cfg = dict(
@@ -66,7 +83,8 @@ def train_cfg(variant: str, mode: str, paths: dict, smoke: bool = False) -> dict
         stage1={"epochs": 1, "lr_lora": 1e-4, "lr_head": 1e-3},
         stage2={"epochs": 2, "lr_lora": 5e-5, "lr_head": 5e-4},
         n_per_label=v["n_per_label"], pool_seed=v["pool_seed"], folds=5, seed=0,
-        timing_steps=60, base=v["base"], mode=mode, smoke=smoke, **paths,
+        timing_steps=60, base=v["base"], mode=mode, smoke=smoke,
+        save_every_min=save_every_min, **paths,
     )  # fmt: skip
     if smoke:
         cfg.update(keep=2, layers=[1, 2], max_len=64, bs=4, n_per_label=10)
@@ -96,6 +114,7 @@ def launch(cfg_path: Path, n_proc: int, log_dir: Path) -> None:
         with open(log_dir / "rank0.log", "w") as f:
             for line in p.stdout:
                 f.write(line)
+                f.flush()
                 if "UNEXPECTED" not in line:  # the per-layer load report of the cut-down model
                     print(line, end="", flush=True)
 
@@ -145,6 +164,12 @@ def run(
     root: Path = REMOTE_DIR,
     out: Path | None = None,  # default data/remote/out/<the variant's out>
     smoke: bool = typer.Option(False, help="Tiny model, local data, 2 CPU processes."),
+    resume: bool = typer.Option(
+        False, help="Continue the run already in --out (from its last save) instead of refusing."
+    ),
+    save_every_min: float = typer.Option(
+        20, help="Save stage 1 this often, so --resume can continue it (0: no saves)."
+    ),
 ):
     """Write cfg.json and train, one process per GPU."""
     import torch
@@ -168,10 +193,14 @@ def run(
         paths = {"comp": found["comp"], "pool": pools[0], "base_dir": base}
         n_proc = gpus or torch.cuda.device_count()
         assert n_proc >= 1, "no GPU visible; pass --smoke for the CPU test"
-    if out.exists() and any(out.iterdir()):
-        raise SystemExit(f"{out} is not empty; move it or pass --out")
+    if out.exists() and any(out.iterdir()) and not resume:
+        raise SystemExit(f"{out} is not empty; move it, pass --out, or pass --resume")
+    if resume and (out / "oof_logits.parquet").exists():
+        raise SystemExit(f"the run in {out} already finished")
     root.mkdir(parents=True, exist_ok=True)
-    cfg = train_cfg(variant, mode, dict(paths, out=str(out)), smoke=smoke)
+    cfg = train_cfg(
+        variant, mode, dict(paths, out=str(out)), smoke=smoke, save_every_min=save_every_min
+    )
     cfg_path = root / f"cfg_{variant}_{mode}.json"
     cfg_path.write_text(json.dumps(cfg, indent=1))
     print(f"mode {mode} | {n_proc} processes | base model {paths['base_dir']} | out {out}")
@@ -189,27 +218,239 @@ def run(
     print(f"done in {(time.time() - t0) / 60:.1f} min")
 
 
+def dataset_ref(variant: str, user: str) -> str:
+    return f"{user}/{VARIANTS[variant]['out'].replace('_', '-')}"
+
+
+def kaggle_cli(*args: str) -> subprocess.CompletedProcess:
+    """The Kaggle CLI (``uv run --with kaggle``: it is not a project dependency)."""
+    cmd = ["uv", "run", "--with", "kaggle", "kaggle", *args]
+    return subprocess.run(cmd, check=False, cwd=PROJ_ROOT, capture_output=True, text=True)
+
+
+PROGRESS = "progress.bin"  # a tar of the output folder; not named .tar, so Kaggle keeps it whole
+
+
+def upload(variant: str, user: str, out: Path, note: str, progress: bool = False) -> bool:
+    """Upload ``out`` as a new version of the private dataset, or as the dataset itself the first
+    time. A finished run goes up as its folder (see ``package``); a run in progress as the single
+    file ``progress.bin``, which ``restore`` can fetch by name. Returns whether Kaggle took it."""
+    import tarfile
+
+    if progress:
+        stage = MODELS_DIR / "upload" / (VARIANTS[variant]["out"] + "_progress")
+        if stage.exists():
+            shutil.rmtree(stage)
+        stage.mkdir(parents=True)
+        with tarfile.open(stage / PROGRESS, "w") as t:
+            t.add(out, arcname=".", filter=lambda i: None if i.name.endswith(".tmp") else i)
+        meta = {
+            "title": f"ntl {VARIANTS[variant]['out'].replace('_', '-')}",
+            "id": dataset_ref(variant, user),
+            "licenses": [{"name": "CC0-1.0"}],
+        }
+        (stage / "dataset-metadata.json").write_text(json.dumps(meta, indent=1))
+    else:
+        stage = package(variant, user=user, out=out, quiet=True)
+    r = kaggle_cli(
+        "datasets", "version", "-p", str(stage), "-m", note, "--dir-mode", "tar",
+        "--delete-old-versions",
+    )  # fmt: skip
+    text = (r.stdout + r.stderr).lower()
+    # Kaggle answers 403, not 404, for a dataset of yours that does not exist yet
+    missing = any(k in text for k in ("not found", "404", "403", "forbidden"))
+    if (r.returncode != 0 or "error" in text) and missing:
+        r = kaggle_cli("datasets", "create", "-p", str(stage), "--dir-mode", "tar")
+    text = (r.stdout + r.stderr).strip()
+    ok = r.returncode == 0 and "error" not in text.lower()
+    print(f"[sync {time.strftime('%H:%M:%S')}] {note}: {'uploaded' if ok else 'FAILED'}\n{text[-800:]}",
+          flush=True)  # fmt: skip
+    return ok
+
+
+def newest_change(out: Path) -> float:
+    return max((f.stat().st_mtime for f in out.rglob("*") if f.is_file()), default=0.0)
+
+
+def sync_loop(variant: str, user: str, out: Path, every_min: float, stop=None) -> None:
+    """Upload ``out`` whenever it has changed, until the run has finished or ``stop`` is set."""
+    sent = 0.0
+    while not (stop and stop.is_set()):
+        if (out / "oof_logits.parquet").exists():
+            return  # the final upload is the caller's
+        changed = out.exists() and newest_change(out) > sent
+        # wait until nothing has been written for a minute, so no file is caught half-written
+        if changed and time.time() - newest_change(out) > 60:
+            stamp = newest_change(out)
+            parts = sorted(p.name for p in out.iterdir())
+            note = f"progress: {', '.join(parts)}"[:200]
+            if upload(variant, user, out, note, progress=True):
+                sent = stamp
+        if stop:
+            stop.wait(60 * every_min)
+        else:
+            time.sleep(60 * every_min)
+
+
+@app.command()
+def sync(
+    variant: str,
+    user: str = typer.Option(..., help="Your Kaggle username (owner of the private dataset)."),
+    out: Path | None = None,
+    every_min: float = typer.Option(10, help="How often to look for changes."),
+    once: bool = typer.Option(False, help="Upload the finished run now and stop."),
+):
+    """Upload the output folder to the private Kaggle dataset whenever it changes, until the run
+    has finished (``oof_logits.parquet`` written), so a lost machine loses at most one save."""
+    v = VARIANTS[variant]
+    out = out or MODELS_DIR / v["out"]
+    if once:
+        raise SystemExit(0 if upload(variant, user, out, "final") else 1)
+    sync_loop(variant, user, out, every_min)
+
+
+@app.command()
+def restore(
+    variant: str,
+    user: str = typer.Option(..., help="Your Kaggle username (owner of the private dataset)."),
+    out: Path | None = None,
+) -> str:
+    """Download the run's last backup into the output folder, for ``run --resume``. Returns
+    "none" (no dataset yet), "restored", or "finished" (the dataset holds a finished run; nothing
+    is downloaded). Fails, instead of letting the run start over, if a backup exists but cannot
+    be fetched."""
+    import tarfile
+
+    v = VARIANTS[variant]
+    out = out or MODELS_DIR / v["out"]
+    ref = dataset_ref(variant, user)
+    for attempt in range(4):
+        r = kaggle_cli("datasets", "files", ref, "--csv", "--page-size", "200")
+        text = r.stdout + r.stderr
+        if "name,size" in r.stdout:
+            break
+        if any(k in text.lower() for k in ("403", "404", "not found", "have access")):
+            print(f"nothing to restore: no dataset {ref} yet")
+            return "none"
+        time.sleep(30 * (attempt + 1))  # a network error must not look like "no backup"
+    else:
+        raise SystemExit(f"cannot list {ref}:\n{text[-600:]}")
+    names = [line.split(",")[0] for line in r.stdout.strip().splitlines()[1:]]
+    if any(n.endswith("oof_logits.parquet") for n in names):
+        print(f"{ref} holds a finished run")
+        return "finished"
+    if PROGRESS not in names:
+        raise SystemExit(f"{ref} has neither {PROGRESS} nor a finished run: {names}")
+    got = REMOTE_DIR / "restore"
+    if got.exists():
+        shutil.rmtree(got)
+    for attempt in range(4):
+        r = kaggle_cli("datasets", "download", ref, "-f", PROGRESS, "-p", str(got))
+        if (got / PROGRESS).exists() and tarfile.is_tarfile(got / PROGRESS):
+            break
+        time.sleep(30 * (attempt + 1))
+    else:
+        raise SystemExit(f"cannot download {PROGRESS} from {ref}:\n{(r.stdout + r.stderr)[-600:]}")
+    out.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(got / PROGRESS) as t:
+        t.extractall(out, filter="data")
+    shutil.rmtree(got)
+    print(f"restored {ref} into {out}: {sorted(p.name for p in out.iterdir())}")
+    return "restored"
+
+
+STATE_FILE = REMOTE_DIR / "state.txt"  # one line: where the unattended run is
+
+
+def mark(state: str) -> None:
+    REMOTE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(f"{state} {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"[unattended] {state}", flush=True)
+
+
+@app.command()
+def unattended(
+    variant: str,
+    user: str = typer.Option("", help="Your Kaggle username; default: the token's owner."),
+    out: Path | None = None,
+    save_every_min: float = typer.Option(20, help="How often stage 1 saves itself."),
+    sync_every_min: float = typer.Option(5, help="How often the backup looks for new saves."),
+):
+    """The whole full run for a machine that can go away (Colab), safe to start again at any
+    time: restore the last backup from the private Kaggle dataset, train from it while backing
+    up every new save, then upload the result. Nothing is written outside this machine's disk
+    and Kaggle. The last line of data/remote/state.txt says how far it is."""
+    import kagglehub
+
+    v = VARIANTS[variant]
+    out = out or MODELS_DIR / v["out"]
+    user = user or kagglehub.whoami()["username"]
+    me = [sys.executable, "-m", "name_that_llm.remote_train"]
+    if not (out.exists() and any(out.iterdir())):  # a fresh machine
+        mark("RESTORING")
+        if restore(variant, user=user, out=out) == "finished":
+            mark("DONE_UPLOADED")
+            return
+    if not (out / "oof_logits.parquet").exists():
+        stop = threading.Event()
+        syncer = threading.Thread(
+            target=sync_loop, args=(variant, user, out, sync_every_min, stop), daemon=True
+        )
+        syncer.start()
+        mark("TRAINING")
+        try:
+            r = subprocess.run(
+                [*me, "run", variant, "--mode", "full", "--out", str(out), "--resume",
+                 "--save-every-min", str(save_every_min)],
+                check=False, cwd=PROJ_ROOT,
+            )  # fmt: skip
+        finally:
+            stop.set()
+            syncer.join()  # let an upload under way finish
+        if r.returncode != 0:
+            mark("FAILED")
+            raise SystemExit(r.returncode)
+    mark("UPLOADING")
+    for attempt in range(5):
+        if upload(variant, user, out, "final"):
+            mark("DONE_UPLOADED")
+            print(f"the member is in the private dataset {dataset_ref(variant, user)}")
+            return
+        time.sleep(60 * (attempt + 1))
+    mark("UPLOAD_FAILED")
+    raise SystemExit(1)
+
+
 @app.command()
 def package(
     variant: str,
     user: str = typer.Option(..., help="Your Kaggle username (owner of the new dataset)."),
     out: Path | None = None,
-):
+    quiet: bool = typer.Option(False, hidden=True),
+) -> Path:
     """Wrap the output folder for upload as a private Kaggle dataset. The submission notebook finds
     a member by its folder name (lora_out*), so the folder keeps the training notebook's name."""
     v = VARIANTS[variant]
     out = out or MODELS_DIR / v["out"]
-    assert (out / "meta.json").exists(), f"no finished run in {out}"
+    if not quiet:
+        assert (out / "meta.json").exists(), f"no finished run in {out}"
     stage = MODELS_DIR / "upload" / v["out"]
     if stage.exists():
         shutil.rmtree(stage)
-    shutil.copytree(out, stage / v["out"])
+    shutil.copytree(out, stage / v["out"], ignore=shutil.ignore_patterns("*.tmp"))
     slug = v["out"].replace("_", "-")
-    meta = {"title": f"ntl {slug}", "id": f"{user}/{slug}", "licenses": [{"name": "CC0-1.0"}]}
+    meta = {
+        "title": f"ntl {slug}",
+        "id": dataset_ref(variant, user),
+        "licenses": [{"name": "CC0-1.0"}],
+    }
     (stage / "dataset-metadata.json").write_text(json.dumps(meta, indent=1))
+    if quiet:
+        return stage
     print(f"staged in {stage}. Upload (private by default) with:\n"
           f"  kaggle datasets create -p {stage} --dir-mode tar\n"
           f"then attach {user}/{slug} to the submission notebook.")  # fmt: skip
+    return stage
 
 
 REPO = "kemalhanan/name-that-llm"
@@ -236,25 +477,23 @@ def colab_cells(variant: str) -> list:
             "give this notebook access. You must have joined the competition on Kaggle.\n"
             "3. Run the timing run first (`MODE = 'timing'`, ~10 min), check its s/step, then "
             "set `MODE = 'full'` and run all again.\n\n"
-            "Keep this tab open while the full run trains: a disconnect stops it, and stage 1 has "
-            "no checkpoint part-way, so it would start over."
+            "Nothing is written to Google Drive. The full run backs itself up to a private "
+            "Kaggle dataset (stage 1 every 20 minutes, each fold as it finishes) and, when "
+            "started again after a disconnect, restores that backup and continues from it. "
+            "`scripts/colab/` starts and watches the same run without this tab."
         ),
         code(
             f"VARIANT = {variant!r}\n"
-            "MODE = 'timing'  # 'timing' (~10 min speed check) or 'full'\n"
-            "KAGGLE_USER = ''  # your Kaggle username, for the upload step\n"
-            "# the full run writes to Google Drive, so the result survives a disconnect\n"
-            f"DRIVE_OUT = '/content/drive/MyDrive/ntl/{v['out']}'"
+            "MODE = 'timing'  # 'timing' (~10 min speed check) or 'full'"
         ),
         md("## Setup"),
         code(
             "import os\n"
             "import subprocess\n\n"
-            "from google.colab import drive, userdata\n\n"
+            "from google.colab import userdata\n\n"
             "print(subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', "
             "'--format=csv'],\n"
             "                     capture_output=True, text=True).stdout)\n"
-            "drive.mount('/content/drive')\n"
             "# a new-style API token (KGAT_...); else the legacy username + key pair\n"
             "try:\n"
             "    os.environ['KAGGLE_API_TOKEN'] = userdata.get('KAGGLE_API_TOKEN').strip()\n"
@@ -278,32 +517,19 @@ def colab_cells(variant: str) -> list:
         code("!uv run python -m name_that_llm.remote_train fetch {VARIANT}"),
         md(
             "## Train\n\n"
-            "Timing runs write to the runtime's disk and start fresh each time. The full run "
-            "writes to `DRIVE_OUT` and refuses to start if that folder holds files, for example "
-            "from a run that was cut off: delete it first."
+            "The timing run writes to the runtime's disk and starts fresh each time. The full "
+            "run restores the last backup from your private Kaggle dataset "
+            f"`{v['out'].replace('_', '-')}` (if there is one), continues from it, uploads every "
+            "new save, and uploads the finished member at the end. Rerun this cell after a "
+            "disconnect; attach the dataset to the submission notebook when it is done."
         ),
         code(
             "if MODE == 'full':\n"
-            "    OUT = DRIVE_OUT\n"
+            "    !uv run python -m name_that_llm.remote_train unattended {VARIANT}\n"
             "else:\n"
-            "    OUT = '/content/timing_out'\n"
-            "    !rm -rf {OUT}\n"
-            "!uv run python -m name_that_llm.remote_train run {VARIANT} --mode {MODE} --out {OUT}"
-        ),
-        md(
-            "## Upload\n\n"
-            "Stages the full run's output with a `dataset-metadata.json`. The folder keeps the "
-            "training notebook's name, which is how the submission notebook finds the member. "
-            "Then upload it (the Kaggle CLI makes new datasets private) and attach it to the "
-            "submission notebook."
-        ),
-        code(
-            "assert MODE == 'full', 'upload only a full run'\n"
-            "assert KAGGLE_USER, 'set KAGGLE_USER in the first cell'\n"
-            "!uv run python -m name_that_llm.remote_train package {VARIANT} --user {KAGGLE_USER} "
-            "--out {DRIVE_OUT}\n"
-            f"STAGE = '/content/ntl/data/remote/out/upload/{v['out']}'\n"
-            "!uv run --with kaggle kaggle datasets create -p {STAGE} --dir-mode tar"
+            "    !rm -rf /content/timing_out\n"
+            "    !uv run python -m name_that_llm.remote_train run {VARIANT} --mode timing "
+            "--out /content/timing_out"
         ),
     ]
 

@@ -12,6 +12,10 @@ notebook's working folder, so it imports ``lora`` as a sibling module there.
 * A batch whose fp16 loss is not finite on any GPU is skipped on all of them, so no GPU waits
   forever for another one's gradients.
 * Without a GPU it runs on CPU with the gloo backend (the local smoke test).
+* With ``"save_every_min"`` in cfg.json (remote_train.py sets it), a run can resume after the
+  machine goes away: stage 1 saves its weights, optimizer and position every that many minutes
+  to ``stage1_resume.pt``, and a rerun on the same output folder skips the finished stage 1 and
+  folds (each fold writes ``holdout.npz`` last) and continues stage 1 from the last save.
 
 With ``"accelerator": "tpu"`` in cfg.json, run it once as ``python lora_ddp.py cfg.json``: it starts
 one PyTorch/XLA process per TPU chip itself (``xmp.spawn``). The recipe is the same; what changes:
@@ -27,6 +31,7 @@ one PyTorch/XLA process per TPU chip itself (``xmp.spawn``). The recipe is the s
   holds only a few copies of the trunk at once, then moves it to its chip.
 """
 
+import copy
 from datetime import timedelta
 import gc
 import json
@@ -49,6 +54,7 @@ try:  # flat files on Kaggle
         LoRAClassifier,
         batches,
         collate,
+        load_checkpoint,
         load_tokenizer,
         load_trunk,
         predict_logits,
@@ -61,6 +67,7 @@ except ImportError:  # inside this package
         LoRAClassifier,
         batches,
         collate,
+        load_checkpoint,
         load_tokenizer,
         load_trunk,
         predict_logits,
@@ -147,11 +154,18 @@ def train_stage_ddp(
     seed: int = 0,
     max_steps: int | None = None,
     log_every: int = 50,
+    resume: str | None = None,
+    save_every_s: float = 0,
 ):
     """``lora.train_stage`` on several processes: same schedule, global batch ``bs``.
 
     ``fwd`` is the DDP wrapper on GPU/CPU (it averages the gradients in backward) and the bare
-    model on XLA (gradients averaged by ``xm.reduce_gradients``)."""
+    model on XLA (gradients averaged by ``xm.reduce_gradients``).
+
+    With ``resume`` (a file path, GPU/CPU only), rank 0 saves the trainable weights, the optimizer,
+    the schedule and the position in the batch order there every ``save_every_s`` seconds; if the
+    file exists at the start, training continues from it. The batch order of the interrupted epoch
+    is rebuilt from the saved RNG state and the batches already done are passed over."""
     rank, world, xla = comm.rank, comm.world, comm.xla
     device = model.head.weight.device
     rng = np.random.default_rng(seed)
@@ -185,14 +199,49 @@ def train_stage_ddp(
     # the steps after the first few (and, on XLA, after most compiling) give the steady s/step
     warm_steps = min(20, total // 2)
 
+    step, skipped, resumed_at = 0, 0, 0
+    if resume and os.path.exists(resume):
+        st = torch.load(resume, map_location="cpu", weights_only=False)
+        model.load_state_dict({k: v.to(device) for k, v in st["model"].items()}, strict=False)
+        opt.load_state_dict(st["opt"])
+        sched.load_state_dict(st["sched"])
+        scaler.load_state_dict(st["scaler"])
+        rng.bit_generator.state = st["epoch_rng"]
+        step, skipped, resumed_at = st["epoch_first_step"], st["skipped"], st["step"]
+        log0(f"resuming at step {resumed_at}/{total} from {resume}")
+        del st
+
+    def save_resume(epoch_rng, epoch_first_step):
+        tmp = resume + ".tmp"
+        torch.save(
+            {
+                "model": model.trainable_state(),
+                "opt": opt.state_dict(),
+                "sched": sched.state_dict(),
+                "scaler": scaler.state_dict(),
+                "epoch_rng": epoch_rng,
+                "epoch_first_step": epoch_first_step,
+                "step": step,
+                "skipped": skipped,
+            },
+            tmp,
+        )
+        os.replace(tmp, resume)  # a copy taken meanwhile gets the old file or the new one, whole
+
     fwd.train()
-    step, skipped, run_n, t0, t_warm = 0, 0, 0, time.time(), None
+    run_n, t0, t_warm = 0, time.time(), None
+    t_saved, t_log, step_log = t0, t0, resumed_at
+    warm_steps = min(resumed_at + warm_steps, total - 1)
     run_loss = torch.zeros((), device=device) if xla else 0.0
     while step < total:
+        epoch_rng, epoch_first_step = copy.deepcopy(rng.bit_generator.state), step
         for idx in batches(ids, bs, shuffle=True, rng=rng):  # same list on every rank
             if step >= total:
                 break
             if len(idx) < min_batch:  # the last batch of an epoch; the same on every rank
+                continue
+            if step < resumed_at:  # done before the restart (the schedule was restored)
+                step += 1
                 continue
             mine = idx[rank::world]
             length = static_len(ids, idx, max_len) if xla else None
@@ -227,8 +276,15 @@ def train_stage_ddp(
             step += 1
             if step == warm_steps:
                 t_warm = time.time()
+            if resume and rank == 0 and step < total and time.time() - t_saved > save_every_s:
+                save_resume(epoch_rng, epoch_first_step)
+                t_saved = time.time()
+                log0(f"saved the stage at step {step} to {resume}")
             if step % log_every == 0 or step == total:
-                el = time.time() - t0
+                now = time.time()
+                el, done = now - t0, step - resumed_at
+                recent = (now - t_log) / max(1, step - step_log)  # this log interval only
+                t_log, step_log = now, step
                 mean = float(run_loss) / max(1, run_n)  # on XLA this waits for the TPU
                 extra = ""
                 if xla:
@@ -238,14 +294,16 @@ def train_stage_ddp(
                     extra = f", {compiles[0] if compiles else 0} XLA compilations"
                 log0(
                     f"step {step}/{total} loss {mean:.4f} "
-                    f"{el / step:.2f}s/step, ~{el / step * (total - step) / 60:.0f} min left, "
-                    f"skipped {skipped}{extra}"
+                    f"{el / done:.2f}s/step (last {recent:.2f}), "
+                    f"~{el / done * (total - step) / 60:.0f} min left, skipped {skipped}{extra}"
                 )
                 run_loss = torch.zeros((), device=device) if xla else 0.0
                 run_n = 0
     fwd.eval()
     t_end = time.time()
     out = {"steps": total, "skipped": skipped, "seconds": t_end - t0}
+    if resumed_at:
+        out["resumed_at"] = resumed_at
     if t_warm is not None and total > warm_steps:
         out["steady_s_per_step"] = (t_end - t_warm) / (total - warm_steps)
     return out
@@ -332,19 +390,31 @@ def run(index, C: dict):
     if use_cuda:
         torch.cuda.reset_peak_memory_stats()
     timing = C["mode"] == "timing"
-    s1 = train_stage_ddp(
-        comm,
-        fwd,
-        model,
-        tok,
-        pool_sample.text,
-        y_pool,
-        **C["stage1"],
-        **common,
-        seed=C["seed"],
-        max_steps=C["timing_steps"] if timing else None,
-        log_every=20 if timing else 200,
-    )
+    save_s = 60 * C.get("save_every_min", 0)
+    resumable = save_s > 0 and not comm.xla
+    s1_resume = f"{out}/stage1_resume.pt" if resumable else None
+    os.makedirs(out, exist_ok=True)
+    if resumable and os.path.exists(f"{out}/stage1/meta.json"):
+        load_checkpoint(model, f"{out}/stage1")
+        with open(f"{out}/stage1/meta.json") as f:
+            s1 = json.load(f)["stage1"]
+        log0(f"stage 1: loaded the finished stage from {out}/stage1")
+    else:
+        s1 = train_stage_ddp(
+            comm,
+            fwd,
+            model,
+            tok,
+            pool_sample.text,
+            y_pool,
+            **C["stage1"],
+            **common,
+            seed=C["seed"],
+            max_steps=C["timing_steps"] if timing else None,
+            log_every=20 if timing else 200,
+            resume=s1_resume,
+            save_every_s=save_s,
+        )
     log0("stage 1:", s1)
     if use_cuda:
         log0(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
@@ -373,6 +443,8 @@ def run(index, C: dict):
     meta = {"labels": labels, "cfg": C, "world_size": world, "stage1": s1, "folds": []}
     if rank == 0:
         save_checkpoint(model, f"{out}/stage1", {"labels": labels, "cfg": C, "stage1": s1})
+        if s1_resume and os.path.exists(s1_resume):
+            os.remove(s1_resume)  # stage1/ now holds the finished stage
 
     s2_steps = 10 if timing else None
     oof = np.zeros((len(train), len(labels)), np.float32)
@@ -380,6 +452,20 @@ def run(index, C: dict):
     for k, (fit_idx, hold_idx) in enumerate(folds):
         if timing:
             hold_idx = hold_idx[:48]
+        done_k = f"{out}/fold{k}/holdout.npz"
+        if resumable and os.path.exists(done_k):  # finished before a restart
+            if rank == 0:
+                with np.load(done_k) as d:
+                    assert np.array_equal(d["idx"], hold_idx), f"fold {k} is not the saved one"
+                    oof[hold_idx], fold_of[hold_idx] = d["z"], k
+                with open(f"{out}/fold{k}/meta.json") as f:
+                    m = json.load(f)
+                bacc = m["holdout_balanced_accuracy"]
+                meta["folds"].append(
+                    dict(fold=k, balanced_accuracy=bacc, n=len(hold_idx), **m["stage2"])
+                )
+                log0(f"fold {k}: loaded, balanced accuracy {bacc:.4f}")
+            continue
         model.load_state_dict({n: v.to(device) for n, v in stage1_state.items()}, strict=False)
         s2 = train_stage_ddp(
             comm,
@@ -410,8 +496,18 @@ def run(index, C: dict):
             save_checkpoint(
                 model,
                 f"{out}/fold{k}",
-                {"labels": labels, "cfg": C, "fold": k, "holdout_balanced_accuracy": bacc},
+                {
+                    "labels": labels,
+                    "cfg": C,
+                    "fold": k,
+                    "holdout_balanced_accuracy": bacc,
+                    "stage2": s2,
+                },
             )
+            if resumable:  # written last: its presence means the fold is complete
+                with open(done_k + ".tmp", "wb") as f:
+                    np.savez(f, idx=hold_idx, z=z)
+                os.replace(done_k + ".tmp", done_k)
             log0(
                 f"fold {k}: balanced accuracy {bacc:.4f} ({len(hold_idx)} passages) "
                 f"after {(time.time() - T0) / 60:.0f} min"
