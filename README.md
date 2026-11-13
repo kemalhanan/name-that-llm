@@ -2,7 +2,7 @@
 
 My solution for the Kaggle code competition [Name That LLM](https://www.kaggle.com/competitions/name-that-llm). The task is to tell which of 18 LLMs wrote a passage of text, scored by balanced accuracy.
 
-**Best public LB: 0.607**. That submission blends a TF-IDF LinearSVC with two Qwen3 LoRA classifiers (4B and 8B), each trained 5-fold.
+**Best public LB: 0.611**. That submission blends a TF-IDF LinearSVC with three LoRA classifiers (Qwen3 4B, Qwen3 8B and Mistral-7B), each trained 5-fold.
 
 ## Approach
 
@@ -10,14 +10,14 @@ My solution for the Kaggle code competition [Name That LLM](https://www.kaggle.c
    - Character 1-5-grams and word 1-2-grams, plus 16 punctuation and style rates per 100 words. A LinearSVC classifies them.
    - Punctuation and quote style separate model families almost on their own, so the text keeps its punctuation and unicode.
    - Trained on `train.csv` plus a class-balanced, style-matched sample of the community [Open Pool](https://www.kaggle.com/datasets/crtproduction/name-that-llm-open-pool) ([dataset.py](name_that_llm/dataset.py)).
-2. **LoRA classifiers on Qwen3** ([lora.py](name_that_llm/lora.py), [lora_ddp.py](name_that_llm/lora_ddp.py))
-   - Only the first 24 decoder layers of Qwen3-4B-Base or Qwen3-8B-Base are kept. Every linear layer gets a LoRA adapter (r=16, alpha=32).
+2. **LoRA classifiers on Qwen3 and Mistral-7B** ([lora.py](name_that_llm/lora.py), [lora_ddp.py](name_that_llm/lora_ddp.py))
+   - Only the first 24 decoder layers of Qwen3-4B-Base, Qwen3-8B-Base or Mistral-7B-v0.1 are kept. Every linear layer gets a LoRA adapter (r=16, alpha=32).
    - A linear head reads mean-pooled hidden states from several depths.
-   - Training has two stages: 1 epoch on a large Open Pool sample (186k passages for the 4B, 152k for the 8B), then 2 epochs on `train.csv`.
-   - Runs in fp16 with DDP on Kaggle's two T4 GPUs.
+   - Training has two stages: 1 epoch on a large Open Pool sample (186k passages for the 4B, 152k for the 8B, 136k for the Mistral-7B), then 2 epochs on `train.csv`.
+   - The Qwen3 models run in fp16 with DDP on Kaggle's two T4 GPUs; the Mistral-7B ran in bf16 on one Colab A100.
    - Each model has 6 adapters: one fitted on all of `train.csv` plus one per prompt-grouped fold. At test time their log-probabilities are averaged.
 3. **Blend** ([modeling/lora_blend.py](name_that_llm/modeling/lora_blend.py), [modeling/postprocess.py](name_that_llm/modeling/postprocess.py))
-   - The models' log-probabilities are added: `log_softmax(2·svm) + 1.0·log_softmax(4B) + 2.0·log_softmax(8B)`.
+   - The models' log-probabilities are added: `log_softmax(2·svm) + 1.0·log_softmax(4B) + 2.0·log_softmax(8B) + 1.0·log_softmax(Mistral-7B)`.
    - Sinkhorn class balancing at strength 0.3 then evens out how often each label is predicted.
    - Weights are picked on out-of-fold predictions.
 
@@ -32,9 +32,10 @@ All cross-validation is `GroupKFold(5)` by `prompt_id`. Every model answered eve
 | + a 4B LoRA trained on a 96k pool sample | 0.563 |
 | + an 8B LoRA trained on an 88k pool sample (4 LoRA members) | 0.569 |
 | + a 5-fold 4B LoRA trained on a 186k pool sample | 0.589 |
-| **SVM + 5-fold 4B (186k) + 5-fold 8B (152k) only** | **0.607** |
+| SVM + 5-fold 4B (186k) + 5-fold 8B (152k) only | 0.607 |
+| **+ a 5-fold Mistral-7B LoRA (136k)** | **0.611** |
 
-The final blend scores 0.6305 balanced accuracy out-of-fold. The best single model is the 5-fold 8B LoRA at 0.615. Per-run metrics are in [reports/](reports/).
+The final blend scores 0.6361 balanced accuracy out-of-fold (0.6305 without the Mistral-7B). The best single model is the 5-fold 8B LoRA at 0.615; the Mistral-7B scores 0.595. Per-run metrics are in [reports/](reports/).
 
 ## Reproducing
 
@@ -58,11 +59,11 @@ The LoRA models train on Kaggle (GPU T4 x2, internet off). These scripts build s
 
 ```bash
 uv run python -m name_that_llm.kaggle_lora_train main --variant 8b-full
-uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lora lora_out_8b_full=2.0 --t-svm 2.0 --path notebooks/kaggle_submission_lora_4bfull_8bfull.ipynb
+uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lora lora_out_8b_full=2.0 --lora lora_out_mistral7b_full=1.0 --t-svm 2.0 --path notebooks/kaggle_submission_lora_4bfull_8bfull_mistral7bfull.ipynb
 ```
 
-- **Training notebook:** set `MODE = "timing"` for a 15-minute speed check, or `"full"` for the real run (about 9 h for the 8B). It needs the competition data, the Open Pool and the Qwen3 base model as inputs.
-- **Submission notebook:** needs the training runs' outputs attached as inputs.
+- **Training notebook:** set `MODE = "timing"` for a 15-minute speed check, or `"full"` for the real run (about 9 h for the 8B). It needs the competition data, the Open Pool and the base model as inputs.
+- **Submission notebook:** needs the training runs' outputs and their base models attached as inputs. A member trained off Kaggle is attached as its private dataset.
 - **TPU:** add `--tpu` to build a training notebook for Kaggle's TPU v5e-8 instead of the two T4s, for example `kaggle_lora_train_4b_full_tpu.ipynb`. It trains in bf16 with fixed tensor shapes and writes the same outputs to a folder ending in `_tpu`. It needs internet on, so it can install PyTorch/XLA if the image lacks it.
 - **Off Kaggle:** `name_that_llm/remote_train.py` runs the same training on any CUDA machine, such as a rented A100 or H100, without using Kaggle GPU quota. It trains in bf16 on those GPUs and keeps the global batch at 8. Upload the output as a private dataset and attach it to the submission notebook:
 
@@ -75,7 +76,8 @@ uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lor
   ```
 
   `fetch` needs a Kaggle API token in `KAGGLE_API_TOKEN` (or the legacy `KAGGLE_USERNAME` and `KAGGLE_KEY`). Outputs go to `data/remote/out/`.
-- **Colab:** [notebooks/colab_lora_train_mistral7b_full.ipynb](notebooks/colab_lora_train_mistral7b_full.ipynb) runs those steps on a Colab A100 and saves the full run to Google Drive ([open in Colab](https://colab.research.google.com/github/kemalhanan/name-that-llm/blob/main/notebooks/colab_lora_train_mistral7b_full.ipynb)). Build it for another variant with `uv run python -m name_that_llm.remote_train colab <variant>`.
+- **Colab:** [notebooks/colab_lora_train_mistral7b_full.ipynb](notebooks/colab_lora_train_mistral7b_full.ipynb) runs the full run on a Colab A100 with `remote_train unattended` ([open in Colab](https://colab.research.google.com/github/kemalhanan/name-that-llm/blob/main/notebooks/colab_lora_train_mistral7b_full.ipynb)). Nothing is written to Google Drive: stage 1 saves every 20 minutes and each fold as it finishes, every save is backed up to a private Kaggle dataset, and a restarted run restores the last backup and continues. Build it for another variant with `uv run python -m name_that_llm.remote_train colab <variant>`.
+- **Colab without a browser tab:** [scripts/colab/](scripts/colab/) starts the same run on a runtime created through the Colab API. `push.py <runtime url> <proxy token>` copies the working tree and your Kaggle token to the runtime, `ensure.sh` reports the run and starts it if it is not running, and `boot.sh` installs and runs it.
 
 Each training run writes held-out logits. Compare and blend them with:
 
