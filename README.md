@@ -90,9 +90,21 @@ uv run python -m name_that_llm.modeling.lora_blend <oof_logits.parquet>... --nam
 
 Design notes for each step are in [references/](references/).
 
+## Model explorer
+
+[gui/](gui/) is a small browser GUI that explains the blend in five steps: a guessing game against the model, a step-by-step walk-through of one passage, a line-up showing how often each of the 18 models is caught, a mixer that recomputes the out-of-fold score as you move the judges' weights, and a list of next moves. Build its data from the reports and out-of-fold predictions, then serve the folder:
+
+```bash
+uv run python gui/build_data.py
+uv run python -m http.server 8765 --directory gui
+```
+
+Open http://localhost:8765. `gui/passages.js` holds a sample of competition passages and is not tracked.
+
 ## Layout
 
 ```
+gui/             browser GUI: game, walk-through, blind spots, mixer, next moves
 data/            raw competition data, external Open Pool, interim logits (not tracked)
 name_that_llm/   package: features, SVM training, LoRA model, blend, notebook builders
 notebooks/       EDA and the generated Kaggle training / submission notebooks

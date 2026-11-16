@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Name That LLM</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <h1>Name That LLM</h1>
+    <p>Five judges, eighteen suspects. Who wrote the passage?</p>
+  </div>
+  <div class="scoreline" id="scoreline"></div>
+</header>
+
+<nav id="tabs" role="tablist"></nav>
+
+<main>
+<!-- 1 -->
+<section class="view" id="v-play">
+  <h2>Can you tell who wrote this?</h2>
+  <p class="lede">Pick the family you think wrote it. Then see what the model said.</p>
+  <div class="passage" id="play-text"></div>
+  <div class="row-between">
+    <button class="link" id="play-clues" type="button">Show clues</button>
+    <span class="muted" id="play-meta"></span>
+  </div>
+  <div id="play-cluelist"></div>
+  <div class="fam-buttons" id="play-buttons"></div>
+  <div id="play-reveal"></div>
+  <div class="scoreboard" id="play-score"></div>
+</section>
+
+<!-- 2 -->
+<section class="view" id="v-how" hidden>
+  <h2>How the model decides</h2>
+  <p class="lede">Four steps, shown on one real passage.</p>
+  <div class="stepper" id="how-rail"></div>
+  <div class="passage small" id="how-text"></div>
+  <div id="how-body"></div>
+  <div class="row-between nav-row">
+    <button id="how-back" type="button">← Back</button>
+    <button class="link" id="how-other" type="button">Try another passage</button>
+    <button class="primary" id="how-next" type="button">Next →</button>
+  </div>
+  <details class="hood">
+    <summary>Under the hood</summary>
+    <ul id="how-hood"></ul>
+  </details>
+</section>
+
+<!-- 3 -->
+<section class="view" id="v-spots" hidden>
+  <h2>Who gets away?</h2>
+  <p class="lede">Each tile is one suspect. The number is how often the model catches it. Tap a tile.</p>
+  <div class="seg" id="spots-sort"></div>
+  <div class="split">
+    <div id="lineup"></div>
+    <div class="detail" id="spot-detail"></div>
+  </div>
+  <h3 class="sec">Three things to know</h3>
+  <div class="facts" id="facts"></div>
+</section>
+
+<!-- 4 -->
+<section class="view" id="v-mix" hidden>
+  <h2>Mix it yourself</h2>
+  <p class="lede">Give each judge more or less say. The score updates as you move.</p>
+  <div class="presets" id="mix-presets"></div>
+  <div class="split mix">
+    <div id="mix-sliders"></div>
+    <div>
+      <div class="dial" id="mix-dial"></div>
+      <div id="mix-movers"></div>
+    </div>
+  </div>
+</section>
+
+<!-- 5 -->
+<section class="view" id="v-next" hidden>
+  <h2>What to do next</h2>
+  <p class="lede">How the score got here, and the moves most worth making. Tap one to open it.</p>
+  <div class="journey" id="journey"></div>
+  <div id="recs"></div>
+  <p class="muted foot">Numbers come from the model's answers on 2,699 passages it never trained on. Rebuild with <code>uv run python gui/build_data.py</code>.</p>
+</section>
+</main>
+
+<script src="data.js"></script>
+<script src="passages.js" onerror="window.NTL_PASSAGES = []"></script>
+<script src="app.js"></script>
+</body>
+</html>
