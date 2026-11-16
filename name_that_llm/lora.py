@@ -59,8 +59,45 @@ def add_lora(model: nn.Module, r: int, alpha: float, dropout: float) -> int:
     return len(targets)
 
 
-def load_trunk(base_dir: str, keep: int, dtype, device, attn_implementation=None) -> nn.Module:
-    """The first ``keep`` decoder layers of the base model, frozen, final norm switched off."""
+def _to_device(x, device):
+    """``x`` with every tensor in it (also inside tuples, lists and dicts) on ``device``."""
+    if torch.is_tensor(x):
+        return x.to(device)
+    if isinstance(x, (tuple, list)):
+        return type(x)(_to_device(v, device) for v in x)
+    if isinstance(x, dict):
+        return {k: _to_device(v, device) for k, v in x.items()}
+    return x
+
+
+def split_trunk(trunk: nn.Module, device, device2) -> int:
+    """Put the embeddings and the first decoder layers on ``device`` and the other layers on
+    ``device2``, about half of the weights on each; returns how many layers stay on ``device``.
+    Each moved layer first brings its inputs (hidden states, mask, rotary tables) to its device."""
+    size = lambda m: sum(q.numel() * q.element_size() for q in m.parameters())
+    half, used, first = size(trunk) / 2, size(trunk.embed_tokens), 0
+    for layer in trunk.layers:
+        if used + size(layer) > half and first > 0:
+            break
+        used, first = used + size(layer), first + 1
+    trunk.embed_tokens.to(device)
+    for i, layer in enumerate(trunk.layers):
+        layer.to(device if i < first else device2)
+        if i >= first:
+            layer.register_forward_pre_hook(
+                lambda mod, args, kwargs: (_to_device(args, device2), _to_device(kwargs, device2)),
+                with_kwargs=True,
+            )
+    return first
+
+
+def load_trunk(
+    base_dir: str, keep: int, dtype, device, attn_implementation=None, device2=None
+) -> nn.Module:
+    """The first ``keep`` decoder layers of the base model, frozen, final norm switched off.
+
+    With ``device2`` (inference only), a trunk too large for ``device`` is split over the two
+    (``split_trunk``): the 24-layer Qwen3-14B trunk is ~19 GB in fp16, a T4 holds 15 GB."""
     cfg = AutoConfig.from_pretrained(base_dir)
     cfg.num_hidden_layers, cfg.use_cache = keep, False
     if getattr(cfg, "layer_types", None) is not None:
@@ -68,10 +105,19 @@ def load_trunk(base_dir: str, keep: int, dtype, device, attn_implementation=None
     kw = {"attn_implementation": attn_implementation} if attn_implementation else {}
     trunk = AutoModel.from_pretrained(base_dir, config=cfg, dtype=dtype, **kw)
     # .to(dtype) too: transformers before 4.56 ignores ``dtype=`` and would load fp32
-    trunk = trunk.to(device=device, dtype=dtype)
+    trunk = trunk.to(dtype=dtype)
     trunk.norm = nn.Identity()
     trunk.requires_grad_(False)
-    return trunk
+    nbytes = sum(q.numel() * q.element_size() for q in trunk.parameters())
+    room = None
+    if device2 is not None and torch.device(device).type == "cuda":
+        room = torch.cuda.get_device_properties(device).total_memory
+    if device2 is not None and (room is None or nbytes > 0.8 * room):
+        first = split_trunk(trunk, device, device2)
+        print(f"trunk of {nbytes / 2**30:.1f} GiB split: embeddings and layers 0-{first - 1} "
+              f"on {device}, layers {first}-{keep - 1} on {device2}")  # fmt: skip
+        return trunk
+    return trunk.to(device)
 
 
 def no_autocast(device_type: str):
@@ -106,7 +152,11 @@ class LoRAClassifier(nn.Module):
         den = m.sum(1).clamp(min=1)
         with no_autocast(input_ids.device.type):
             z = torch.cat(
-                [nm((hs[l].float() * m).sum(1) / den) for l, nm in zip(self.layers, self.norms)],
+                # .to: a split trunk returns its later hidden states on the second device
+                [
+                    nm((hs[l].to(m.device).float() * m).sum(1) / den)
+                    for l, nm in zip(self.layers, self.norms)
+                ],
                 -1,
             )
             return self.head(z)

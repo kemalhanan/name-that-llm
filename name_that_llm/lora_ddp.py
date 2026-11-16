@@ -17,6 +17,12 @@ notebook's working folder, so it imports ``lora`` as a sibling module there.
   to ``stage1_resume.pt``, and a rerun on the same output folder skips the finished stage 1 and
   folds (each fold writes ``holdout.npz`` last) and continues stage 1 from the last save.
 
+With ``"split": true`` in cfg.json and one process, a trunk too large for one GPU is spread over
+two (``lora.split_trunk``): the 24-layer Qwen3-14B trunk on two 15 GB T4s. With
+``"stop_after_min"``, the run saves and stops cleanly once that much time has passed (a Kaggle
+session ends after 12 h and keeps the output only of a run that finished): it prints ``PAUSED``
+and exits with code 0, and a later run on the same output folder continues it.
+
 With ``"accelerator": "tpu"`` in cfg.json, run it once as ``python lora_ddp.py cfg.json``: it starts
 one PyTorch/XLA process per TPU chip itself (``xmp.spawn``). The recipe is the same; what changes:
 
@@ -89,6 +95,16 @@ def sample_pool(pool: pd.DataFrame, n_per_label: int, seed: int) -> pd.DataFrame
 
 
 RANK = 0  # this process's rank, set in run()
+DEADLINE = None  # time.time() after which the run saves and stops (cfg "stop_after_min")
+RATE = None  # seconds per step of the last training stage in this process
+
+
+class Paused(Exception):
+    """The time budget is used up; what is done is saved, and a rerun continues from it."""
+
+
+def out_of_time(need_s: float = 0.0) -> bool:
+    return DEADLINE is not None and time.time() + need_s > DEADLINE
 
 
 def log0(*args):
@@ -205,7 +221,8 @@ def train_stage_ddp(
         model.load_state_dict({k: v.to(device) for k, v in st["model"].items()}, strict=False)
         opt.load_state_dict(st["opt"])
         sched.load_state_dict(st["sched"])
-        scaler.load_state_dict(st["scaler"])
+        if st["scaler"] and scaler.is_enabled():  # empty when saved by a bf16 run (no scaling)
+            scaler.load_state_dict(st["scaler"])
         rng.bit_generator.state = st["epoch_rng"]
         step, skipped, resumed_at = st["epoch_first_step"], st["skipped"], st["step"]
         log0(f"resuming at step {resumed_at}/{total} from {resume}")
@@ -280,6 +297,10 @@ def train_stage_ddp(
                 save_resume(epoch_rng, epoch_first_step)
                 t_saved = time.time()
                 log0(f"saved the stage at step {step} to {resume}")
+            # one process only: several would have to agree on the step at which to stop
+            if resume and world == 1 and step < total and step % 20 == 0 and out_of_time():
+                save_resume(epoch_rng, epoch_first_step)
+                raise Paused(f"stage paused at step {step}/{total}, saved to {resume}")
             if step % log_every == 0 or step == total:
                 now = time.time()
                 el, done = now - t0, step - resumed_at
@@ -301,6 +322,9 @@ def train_stage_ddp(
                 run_n = 0
     fwd.eval()
     t_end = time.time()
+    global RATE
+    if step > resumed_at:
+        RATE = (t_end - t0) / (step - resumed_at)
     out = {"steps": total, "skipped": skipped, "seconds": t_end - t0}
     if resumed_at:
         out["resumed_at"] = resumed_at
@@ -314,10 +338,15 @@ def build_model(comm, C: dict, n_classes: int):
     what to call for the forward pass (DDP on GPU/CPU, the bare model on XLA)."""
     if not comm.xla:
         torch.manual_seed(C["seed"])  # same LoRA and head init on every rank (DDP broadcasts too)
-        dtype = comm.amp if comm.device.type == "cuda" else torch.float32
-        trunk = load_trunk(C["base_dir"], C["keep"], dtype, comm.device)
-        model = LoRAClassifier(trunk, C["layers"], n_classes, C["r"], C["alpha"], C["dropout"])
         on_gpu = comm.device.type == "cuda"
+        dtype = comm.amp if on_gpu else torch.float32
+        # one process, two GPUs: a trunk too large for one of them is spread over both
+        split = C.get("split") and on_gpu and comm.world == 1 and torch.cuda.device_count() > 1
+        device2 = torch.device("cuda", 1 - comm.device.index) if split else None
+        trunk = load_trunk(C["base_dir"], C["keep"], dtype, comm.device, device2=device2)
+        model = LoRAClassifier(trunk, C["layers"], n_classes, C["r"], C["alpha"], C["dropout"])
+        if split:  # nothing to average with one process, and DDP wants one device per module
+            return model, model
         return model, DDP(model, device_ids=[comm.device.index] if on_gpu else None)
     # XLA: build on the CPU (CPU RNG, so the same init everywhere), a few ranks at a time
     wave = C.get("load_parallel", 4)
@@ -355,9 +384,19 @@ def main(cfg_path: str):
 
 
 def run(index, C: dict):
-    global RANK
+    global RANK, DEADLINE
     comm = Comm(xla=C.get("accelerator") == "tpu")
     RANK = comm.rank
+    if C.get("stop_after_min"):
+        DEADLINE = time.time() + 60 * C["stop_after_min"]
+    try:
+        train_all(comm, C)
+    except Paused as e:
+        log0(f"PAUSED: {e}. Run again on the same output folder to continue.")
+    comm.close()
+
+
+def train_all(comm, C: dict):
     rank, world, device, amp = comm.rank, comm.world, comm.device, comm.amp
     use_cuda = device.type == "cuda"
     T0 = time.time()
@@ -417,7 +456,8 @@ def run(index, C: dict):
         )
     log0("stage 1:", s1)
     if use_cuda:
-        log0(f"peak GPU memory {torch.cuda.max_memory_allocated() / 2**30:.1f} GiB")
+        peaks = [torch.cuda.max_memory_allocated(i) / 2**30 for i in range(torch.cuda.device_count())]
+        log0("peak GPU memory " + ", ".join(f"{p:.1f} GiB" for p in peaks if p > 0.01))
     if comm.xla and rank == 0:
         try:
             log0(f"TPU memory: {comm.xm.get_memory_info(device)}")
@@ -466,6 +506,10 @@ def run(index, C: dict):
                 )
                 log0(f"fold {k}: loaded, balanced accuracy {bacc:.4f}")
             continue
+        fold_steps = 2 * -(-len(fit_idx) // C["bs"])
+        # a fold cannot be saved half-way: start it only if it fits in the time left
+        if resumable and not timing and out_of_time(1.15 * fold_steps * RATE if RATE else 3600):
+            raise Paused(f"no time left for fold {k}")
         model.load_state_dict({n: v.to(device) for n, v in stage1_state.items()}, strict=False)
         s2 = train_stage_ddp(
             comm,
@@ -514,6 +558,9 @@ def run(index, C: dict):
             )
         comm.barrier(f"fold{k}")
 
+    all_steps = 2 * -(-len(train) // C["bs"])
+    if resumable and not timing and out_of_time(1.15 * all_steps * RATE if RATE else 3600):
+        raise Paused("no time left for the fit on all of train.csv")
     model.load_state_dict({n: v.to(device) for n, v in stage1_state.items()}, strict=False)
     s2_all = train_stage_ddp(
         comm,
@@ -552,7 +599,6 @@ def run(index, C: dict):
         )
         log0(f"saved to {out} in {(time.time() - T0) / 60:.1f} min")
     comm.barrier("done")
-    comm.close()
 
 
 if __name__ == "__main__":

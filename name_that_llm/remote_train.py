@@ -139,6 +139,31 @@ def launch(cfg_path: Path, n_proc: int, log_dir: Path) -> None:
         raise SystemExit(f"training processes exited with {codes}")
 
 
+def download_model(source: str) -> str:
+    """The base model's folder. kagglehub can fail on one small file after fetching the rest (it
+    raised ``KaggleApiHTTPError: 1994`` on Qwen3-14B's vocab.json, although the server answered
+    200). The download is then still usable if the config, the tokenizer and every weight file
+    named in the index are there, since the tokenizer loads from tokenizer.json alone."""
+    import kagglehub
+
+    try:
+        return kagglehub.model_download(source)
+    except Exception as e:  # noqa: BLE001
+        cache = Path(os.environ.get("KAGGLEHUB_CACHE", Path.home() / ".cache" / "kagglehub"))
+        for d in sorted((cache / "models" / source).glob("*"), reverse=True):
+            index = d / "model.safetensors.index.json"
+            if not ((d / "config.json").exists() and (d / "tokenizer.json").exists()):
+                continue
+            if index.exists():
+                shards = set(json.loads(index.read_text())["weight_map"].values())
+            else:
+                shards = {"model.safetensors"}
+            if all((d / s).exists() for s in shards):
+                print(f"kagglehub failed on a file the model does not need ({e!s:.80}); using {d}")
+                return str(d)
+        raise
+
+
 @app.command()
 def fetch(variant: str, root: Path = REMOTE_DIR):
     """Download the competition data, the Open Pool and the variant's base model."""
@@ -149,7 +174,7 @@ def fetch(variant: str, root: Path = REMOTE_DIR):
     found = {
         "comp": kagglehub.competition_download(COMPETITION),
         "pool": kagglehub.dataset_download(POOL_DATASET),
-        "model": kagglehub.model_download(v["source"]),
+        "model": download_model(v["source"]),
     }
     find_base(found["model"], v["base"])  # fail now, not after the pool sample is drawn
     (root / "inputs.json").write_text(json.dumps(found, indent=1))

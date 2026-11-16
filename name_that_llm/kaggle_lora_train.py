@@ -122,6 +122,21 @@ VARIANTS = {
         "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_mistral7b_full.ipynb",
         "ddp": True,
     },
+    # the largest Qwen3 base: first 24 of its 40 layers (hidden 5,120). Its trunk is ~19 GB in
+    # 16-bit floats, more than one T4 holds, so one process spreads it over both T4s ("split")
+    # instead of running a copy on each. That is slow: the run pauses itself before the 12 h
+    # session limit and the next session continues from the saved state (see RESTORE_CODE)
+    "14b-full": {
+        "name": "Qwen3-14B-Base",
+        "source": "qwen-lm/qwen-3/Transformers/14b-base",
+        "base": {"model_type": "qwen3", "hidden_size": 5120, "num_hidden_layers": 40},
+        "pool_seed": 7,
+        "n_per_label": 12000,
+        "out": "lora_out_14b_full",
+        "notebook": PROJ_ROOT / "notebooks" / "kaggle_lora_train_14b_full.ipynb",
+        "ddp": True,
+        "split": True,
+    },
 }
 
 # Starts one training process per GPU (what torchrun does, without its launcher, which needs
@@ -171,6 +186,33 @@ assert codes == [0] * n_proc, f'training processes exited with {codes}'
 """
 
 
+# A run that pauses itself (cfg "stop_after_min") continues in a later session from what it saved.
+# Attach that as an input: either a dataset holding progress.bin (a tar of the output folder, as
+# remote_train.py uploads it), or the output of the earlier session with the folder itself.
+RESTORE_CODE = """\
+import shutil
+import tarfile
+
+out = CFG['out']
+if ON_KAGGLE and MODE == 'full' and not os.path.exists(out):
+    tars = sorted(glob.glob('/kaggle/input/**/progress.bin', recursive=True))
+    dirs = [d for d in glob.glob(f'/kaggle/input/**/{os.path.basename(out)}', recursive=True)
+            if os.path.isdir(d)]
+    if tars:
+        os.makedirs(out)
+        with tarfile.open(tars[0]) as t:
+            t.extractall(out, filter='data')
+        print('restored', tars[0], '->', sorted(os.listdir(out)))
+    elif dirs:
+        shutil.copytree(dirs[0], out)
+        print('restored', dirs[0], '->', sorted(os.listdir(out)))
+    else:
+        print('nothing to restore: starting from the beginning')
+    # a session meant to continue must not quietly start again from step 0
+    saved = os.path.exists(f'{out}/stage1_resume.pt') or os.path.exists(f'{out}/stage1/meta.json')
+    assert saved or not NEED_SAVED, f'no saved state among the inputs: {attached}'
+"""
+
 # Kaggle's TPU image may lack PyTorch/XLA or transformers; the training notebook may use the
 # internet (only submission notebooks run offline), so install what is missing. torch_xla must
 # match the installed torch version.
@@ -216,11 +258,14 @@ assert proc.wait() == 0, f'training exited with {proc.returncode}'
 """
 
 
-def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
+def build_ddp(
+    mode: str, variant: str, tpu: bool = False, need_saved: bool = False
+) -> nbf.NotebookNode:
     """The multi-GPU (or TPU), 5-fold training notebook: writes lora.py and lora_ddp.py next to
     it and runs one training process per GPU (or TPU chip)."""
     v = VARIANTS[variant]
     out = v["out"] + ("_tpu" if tpu else "")
+    split = bool(v.get("split")) and not tpu
     md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
     where = "TPU v5e-8" if tpu else "both GPUs"
     if tpu:
@@ -232,6 +277,8 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
     else:
         needs = "Needs **GPU T4 x2**, internet off, and three inputs: the competition data, "
         parallel = "data-parallel on every GPU"
+        if split:
+            parallel = "in one process with the trunk spread over both GPUs"
     cells = [
         md(
             f"# Name That LLM: two-stage LoRA classifier on {v['name']}, {where}, 5 folds "
@@ -251,6 +298,13 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
             + needs
             + f"`crtproduction/name-that-llm-open-pool` and `{v['source']}`.\n\n"
             "To switch between the timing run and the full run, change `MODE` in the next cell."
+            + (
+                "\n\nThe full run takes more than one 12 h session: it saves and stops after 11 h, "
+                "and the next session continues from that. Attach the saved state as a fourth "
+                "input (a dataset with `progress.bin`, or the earlier session's output)."
+                if split
+                else ""
+            )
         ),
         *([code(TPU_SETUP_CODE)] if tpu else []),
         code(
@@ -309,6 +363,12 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
                 if tpu
                 else ""
             )
+            + (
+                "    # one process over both GPUs; save every 20 min, stop after 11 h\n"
+                "    split=True, save_every_min=20, stop_after_min=660,\n"
+                if split
+                else ""
+            )
             + ")\n"
             "if SMOKE:\n"
             "    CFG.update(keep=2, layers=[1, 2], max_len=64, bs=4, n_per_label=10)\n"
@@ -322,6 +382,7 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
                 "paths['base_dir'])"
             )
         ),
+        *([code(f"NEED_SAVED = {need_saved}\n" + RESTORE_CODE)] if split else []),
         md("## Training code (copied from `name_that_llm/lora.py` and `lora_ddp.py`)"),
         code("%%writefile lora.py\n" + inspect.getsource(lora)),
         code("%%writefile lora_ddp.py\n" + inspect.getsource(lora_ddp)),
@@ -345,6 +406,11 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
             + "else:\n"
             + textwrap.indent(DDP_LAUNCH_CODE, "    ")
             if tpu
+            else DDP_LAUNCH_CODE.replace(
+                "n_proc = torch.cuda.device_count() or 2  # 2 CPU processes for the local smoke test",
+                "n_proc = 1 if ON_KAGGLE else 2  # one process holds both GPUs",
+            )
+            if split
             else DDP_LAUNCH_CODE
         ),
         md("## Summary"),
@@ -354,10 +420,13 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
             "if MODE == 'timing':\n"
             "    print('timing run: these scores come from 10 stage-2 steps per fold and only '\n"
             "          'show that every step runs; set MODE to full for the real run')\n"
-            "meta = json.load(open(f\"{CFG['out']}/meta.json\"))\n"
-            "for fold in meta['folds']:\n"
-            "    print(f\"fold {fold['fold']}: {fold['balanced_accuracy']:.4f} ({fold['n']} passages)\")\n"
-            "print(f\"out-of-fold: {meta['oof_balanced_accuracy']:.4f}\")\n"
+            "if os.path.exists(f\"{CFG['out']}/meta.json\"):\n"
+            "    meta = json.load(open(f\"{CFG['out']}/meta.json\"))\n"
+            "    for fold in meta['folds']:\n"
+            "        print(f\"fold {fold['fold']}: {fold['balanced_accuracy']:.4f} ({fold['n']} passages)\")\n"
+            "    print(f\"out-of-fold: {meta['oof_balanced_accuracy']:.4f}\")\n"
+            "else:\n"
+            "    print('PAUSED before the end: run the next session with this output attached')\n"
             "print('outputs:', sorted(os.listdir(CFG['out'])))\n"
             "print(f'done in {(time.time() - T0) / 60:.1f} min')"
         ),
@@ -371,10 +440,12 @@ def build_ddp(mode: str, variant: str, tpu: bool = False) -> nbf.NotebookNode:
     )
 
 
-def build(mode: str, variant: str = "4b", tpu: bool = False) -> nbf.NotebookNode:
+def build(
+    mode: str, variant: str = "4b", tpu: bool = False, need_saved: bool = False
+) -> nbf.NotebookNode:
     v = VARIANTS[variant]
     if v.get("ddp"):
-        return build_ddp(mode, variant, tpu)
+        return build_ddp(mode, variant, tpu, need_saved)
     if tpu:
         raise ValueError(f"variant {variant} is single-GPU; --tpu needs a multi-process variant")
     md, code = nbf.v4.new_markdown_cell, nbf.v4.new_code_cell
@@ -562,6 +633,9 @@ def main(
     variant: str = typer.Option("4b", help=f"Ensemble member: {', '.join(VARIANTS)}."),
     path: Path | None = None,  # default: the variant's own notebook
     tpu: bool = typer.Option(False, help="Train on a Kaggle TPU v5e-8 (multi-process variants)."),
+    need_saved: bool = typer.Option(
+        False, help="Split variants: fail unless an input holds the state saved by an earlier run."
+    ),
 ):
     if mode not in ("timing", "full"):
         raise typer.BadParameter("mode is 'timing' or 'full'")
@@ -570,7 +644,7 @@ def main(
     path = path or VARIANTS[variant]["notebook"]
     if tpu and path == VARIANTS[variant]["notebook"]:
         path = path.with_name(path.stem + "_tpu.ipynb")
-    nbf.write(build(mode, variant, tpu), path)
+    nbf.write(build(mode, variant, tpu, need_saved), path)
     print(f"wrote {path} (variant={variant}, MODE={mode!r}, tpu={tpu})")
 
 

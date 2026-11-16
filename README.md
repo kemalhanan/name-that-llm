@@ -2,7 +2,7 @@
 
 My solution for the Kaggle code competition [Name That LLM](https://www.kaggle.com/competitions/name-that-llm). The task is to tell which of 18 LLMs wrote a passage of text, scored by balanced accuracy.
 
-**Best public LB: 0.611**. That submission blends a TF-IDF LinearSVC with three LoRA classifiers (Qwen3 4B, Qwen3 8B and Mistral-7B), each trained 5-fold.
+**Best public LB: 0.629**. That submission blends a TF-IDF LinearSVC with four LoRA classifiers (Qwen3 4B, 8B and 14B, and Mistral-7B), each trained 5-fold.
 
 ## Approach
 
@@ -11,13 +11,14 @@ My solution for the Kaggle code competition [Name That LLM](https://www.kaggle.c
    - Punctuation and quote style separate model families almost on their own, so the text keeps its punctuation and unicode.
    - Trained on `train.csv` plus a class-balanced, style-matched sample of the community [Open Pool](https://www.kaggle.com/datasets/crtproduction/name-that-llm-open-pool) ([dataset.py](name_that_llm/dataset.py)).
 2. **LoRA classifiers on Qwen3 and Mistral-7B** ([lora.py](name_that_llm/lora.py), [lora_ddp.py](name_that_llm/lora_ddp.py))
-   - Only the first 24 decoder layers of Qwen3-4B-Base, Qwen3-8B-Base or Mistral-7B-v0.1 are kept. Every linear layer gets a LoRA adapter (r=16, alpha=32).
+   - Only the first 24 decoder layers of Qwen3-4B-Base, Qwen3-8B-Base, Qwen3-14B-Base or Mistral-7B-v0.1 are kept. Every linear layer gets a LoRA adapter (r=16, alpha=32).
    - A linear head reads mean-pooled hidden states from several depths.
-   - Training has two stages: 1 epoch on a large Open Pool sample (186k passages for the 4B, 152k for the 8B, 136k for the Mistral-7B), then 2 epochs on `train.csv`.
-   - The Qwen3 models run in fp16 with DDP on Kaggle's two T4 GPUs; the Mistral-7B ran in bf16 on one Colab A100.
+   - Training has two stages: 1 epoch on a large Open Pool sample (186k passages for the 4B, 152k for the 8B, 193k for the 14B, 136k for the Mistral-7B), then 2 epochs on `train.csv`.
+   - The Qwen3 4B and 8B run in fp16 with DDP on Kaggle's two T4 GPUs; the Mistral-7B ran in bf16 on one Colab A100.
+   - The 14B's 24-layer trunk is 16.2 GiB in fp16, more than one T4 holds. It is split instead: embeddings and layers 0-9 on the first GPU, layers 10-23 on the second, in a single process. Its run began on a Colab A100 and finished on Kaggle.
    - Each model has 6 adapters: one fitted on all of `train.csv` plus one per prompt-grouped fold. At test time their log-probabilities are averaged.
 3. **Blend** ([modeling/lora_blend.py](name_that_llm/modeling/lora_blend.py), [modeling/postprocess.py](name_that_llm/modeling/postprocess.py))
-   - The models' log-probabilities are added: `log_softmax(2·svm) + 1.0·log_softmax(4B) + 2.0·log_softmax(8B) + 1.0·log_softmax(Mistral-7B)`.
+   - The models' log-probabilities are added: `log_softmax(2·svm) + 0.25·log_softmax(4B) + 0.5·log_softmax(8B) + 0.5·log_softmax(Mistral-7B) + 1.0·log_softmax(14B)`.
    - Sinkhorn class balancing at strength 0.3 then evens out how often each label is predicted.
    - Weights are picked on out-of-fold predictions.
 
@@ -33,9 +34,10 @@ All cross-validation is `GroupKFold(5)` by `prompt_id`. Every model answered eve
 | + an 8B LoRA trained on an 88k pool sample (4 LoRA members) | 0.569 |
 | + a 5-fold 4B LoRA trained on a 186k pool sample | 0.589 |
 | SVM + 5-fold 4B (186k) + 5-fold 8B (152k) only | 0.607 |
-| **+ a 5-fold Mistral-7B LoRA (136k)** | **0.611** |
+| + a 5-fold Mistral-7B LoRA (136k) | 0.611 |
+| **+ a 5-fold Qwen3-14B LoRA (193k)** | **0.629** |
 
-The final blend scores 0.6361 balanced accuracy out-of-fold (0.6305 without the Mistral-7B). The best single model is the 5-fold 8B LoRA at 0.615; the Mistral-7B scores 0.595. Per-run metrics are in [reports/](reports/).
+The final blend scores 0.6531 balanced accuracy out-of-fold (0.6361 without the 14B, 0.6305 without the Mistral-7B as well). The best single model is the 5-fold 14B LoRA at 0.630; the 8B scores 0.615, the 4B 0.597 and the Mistral-7B 0.595. Per-run metrics are in [reports/](reports/).
 
 ## Reproducing
 
@@ -59,10 +61,11 @@ The LoRA models train on Kaggle (GPU T4 x2, internet off). These scripts build s
 
 ```bash
 uv run python -m name_that_llm.kaggle_lora_train main --variant 8b-full
-uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=1.0 --lora lora_out_8b_full=2.0 --lora lora_out_mistral7b_full=1.0 --t-svm 2.0 --path notebooks/kaggle_submission_lora_4bfull_8bfull_mistral7bfull.ipynb
+uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=0.25 --lora lora_out_8b_full=0.5 --lora lora_out_mistral7b_full=0.5 --lora lora_out_14b_full=1.0 --t-svm 2.0 --path notebooks/kaggle_submission_lora_4bfull_8bfull_mistral7bfull_14bfull.ipynb
 ```
 
 - **Training notebook:** set `MODE = "timing"` for a 15-minute speed check, or `"full"` for the real run (about 9 h for the 8B). It needs the competition data, the Open Pool and the base model as inputs.
+- **Runs longer than one session:** the `14b-full` variant needs about 30 h on two T4s, more than Kaggle's 12-hour session. Its notebook saves stage 1 every 20 minutes and each fold as it finishes, and stops cleanly after 11 hours so Kaggle keeps the output. To continue, attach the previous version's output (or a dataset holding its `progress.bin`) as an input and run it again; build it with `--need-saved` to make it fail at the start if no saved state is attached. Wait for one version to finish before pushing the next: a new version does not cancel a running one.
 - **Submission notebook:** needs the training runs' outputs and their base models attached as inputs. A member trained off Kaggle is attached as its private dataset.
 - **TPU:** add `--tpu` to build a training notebook for Kaggle's TPU v5e-8 instead of the two T4s, for example `kaggle_lora_train_4b_full_tpu.ipynb`. It trains in bf16 with fixed tensor shapes and writes the same outputs to a folder ending in `_tpu`. It needs internet on, so it can install PyTorch/XLA if the image lacks it.
 - **Off Kaggle:** `name_that_llm/remote_train.py` runs the same training on any CUDA machine, such as a rented A100 or H100, without using Kaggle GPU quota. It trains in bf16 on those GPUs and keeps the global batch at 8. Upload the output as a private dataset and attach it to the submission notebook:
