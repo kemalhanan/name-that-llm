@@ -39,6 +39,8 @@ requires-python = "~=3.12.0"
 line-length = 99
 src = ["name_that_llm"]
 include = ["pyproject.toml", "name_that_llm/**/*.py"]
+# third-party files copied unchanged (their sha256 is checked)
+extend-exclude = ["name_that_llm/glm_ll"]
 
 [tool.ruff.lint]
 extend-select = ["I"]  # Add import sorting

@@ -1,0 +1,1103 @@
+diff --git a/src/llama-hparams.h b/src/llama-hparams.h
+index 7b73840..a9df4a8 100644
+--- a/src/llama-hparams.h
++++ b/src/llama-hparams.h
+@@ -280,6 +280,13 @@ struct llama_hparams {
+     // output embedding dimension (0 = use n_embd)
+     uint32_t n_embd_out_impl = 0;
+ 
++    // [ntl-segrun] layer range held by a layer-segment GGUF (keys ntl.layer_start / ntl.layer_end)
++    // seg_layer_end == 0 means the whole trunk [0, n_layer)
++    uint32_t seg_layer_start = 0;
++    uint32_t seg_layer_end   = 0;
++    // true if the trunk layer il belongs to the segment (memory is only allocated for those layers)
++    bool in_seg(uint32_t il) const { return seg_layer_end == 0 || (il >= seg_layer_start && il < seg_layer_end); }
++
+     uint32_t dflash_block_size       = 0;
+     uint32_t dflash_conv_kernel_size = 0;
+     uint32_t dflash_conv_group_size  = 0;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index dbc91a1..460b125 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2996,11 +2996,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                 } else {
+                     // Main context: DSA cache for the trunk layers only - the nextn
+                     // layer(s) are never attended by the trunk graph.
+-                    llama_kv_cache::layer_filter_cb filter_mla = nullptr;
+-                    if (hparams.n_layer_nextn > 0) {
+-                        filter_mla = [&](uint32_t il) { return il < hparams.n_layer(); };
+-                    }
+-                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
++                    // [ntl-segrun] only the layers of the segment get a cache
++                    llama_kv_cache::layer_filter_cb filter_mla = [&](uint32_t il) { return il < hparams.n_layer() && hparams.in_seg(il); };
++                    llama_kv_cache::layer_filter_cb filter_lid = [&](uint32_t il) { return il < hparams.n_layer() && hparams.in_seg(il) && (arch != LLM_ARCH_GLM_DSA || hparams.is_indexer_full(il)); };
+ 
+                     res = new llama_kv_cache_dsa(
+                             *this,
+@@ -3049,14 +3047,15 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+             {
+                 // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
+                 // tThe Nextn block is never attended by the trunk graph
++                // [ntl-segrun] only the layers of the segment get a cache
+                 llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && !hparams.is_recr(il);
++                    return il < hparams.n_layer() && hparams.in_seg(il) && !hparams.is_recr(il);
+                 };
+                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
++                    return il < hparams.n_layer() && hparams.in_seg(il) && !hparams.is_recr(il) && hparams.is_indexer_full(il);
+                 };
+                 llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) {
+-                    return il < hparams.n_layer() && hparams.is_recr(il);
++                    return il < hparams.n_layer() && hparams.in_seg(il) && hparams.is_recr(il);
+                 };
+ 
+                 // the draft head is a single DSA layer
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 7007f42..6eaa7ef 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -1,6 +1,7 @@
+ #include "models.h"
+ 
+ #include "llama-kv-cache-dsa.h"
++#include "ntl-segment.h"
+ 
+ // https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L26
+ const std::array<uint32_t, LLAMA_MAX_LAYERS> GLM_5_2_DEFAULT_INDEXER_TYPES = {
+@@ -65,6 +66,27 @@ void llama_model_glm_dsa::load_arch_hparams(llama_model_loader & ml) {
+     }
+     ml.get_key_or_arr(LLM_KV_ATTENTION_INDEXER_TYPES, hparams.is_indexer_full_impl, hparams.n_layer(), false);
+ 
++    // [ntl-segrun] layer-segment GGUF: only trunk layers [start, end) are present.
++    // A segment that does not start at layer 0 takes the residual stream [n_embd] per token as input (batch.embd),
++    // a segment that does not end at n_layer returns it as its (per-token) embeddings.
++    {
++        uint32_t s = 0;
++        uint32_t e = 0;
++        ml.get_key(std::string("ntl.layer_start"), s, false);
++        ml.get_key(std::string("ntl.layer_end"),   e, false);
++        if (e == 0 || e > hparams.n_layer()) {
++            e = hparams.n_layer();
++        }
++        GGML_ASSERT(s < e && "ntl segment: empty layer range");
++        GGML_ASSERT(hparams.is_indexer_full(s) && "ntl segment: the first layer of a segment needs a full indexer");
++        hparams.seg_layer_start = s;
++        hparams.seg_layer_end   = e;
++        if (s > 0 || e < hparams.n_layer()) {
++            LLAMA_LOG_INFO("%s: ntl segment: trunk layers [%u, %u) of %u, state width %u\n",
++                    __func__, s, e, hparams.n_layer(), hparams.n_embd);
++        }
++    }
++
+     switch (hparams.n_layer()) {
+         case 78: type = LLM_TYPE_744B_A40B; break;
+         default: type = LLM_TYPE_UNKNOWN;
+@@ -96,20 +118,38 @@ void llama_model_glm_dsa::load_arch_tensors(llama_model_loader & ml) {
+ 
+     const int64_t n_ff_exp        = hparams.n_ff_exp();
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    // [ntl-segrun] tensors outside the segment are skipped (or simply absent from a segment file)
++    const int  seg_s     = (int) hparams.seg_layer_start;
++    const int  seg_e     = (int) hparams.seg_layer_end;
++    const bool seg_first = seg_s == 0;
++    const bool seg_last  = seg_e == n_layer;
++    const bool segmented = !seg_first || !seg_last;
++    const int  seg_skip  = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
++
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, seg_first ? 0 : seg_skip);
+ 
+     // output
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, seg_last ? 0 : seg_skip);
+     // try to load output.weight, if not found, use token_embd (tied embeddings)
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, TENSOR_NOT_REQUIRED);
+-    if (!output) {
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, seg_last ? TENSOR_NOT_REQUIRED : seg_skip);
++    if (!output && !segmented) {
+         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
+     }
++    if (!output && seg_last) {
++        throw std::runtime_error("ntl segment: the last segment needs output.weight (tied embeddings are not supported)");
++    }
+ 
+     for (int i = 0; i < n_layer_all; ++i) {
+         // NextN/MTP layers (i >= n_layer) are full decoder blocks used by the
+         // LLM_GRAPH_TYPE_DECODER_MTP draft head; load them like qwen35moe/step35/hy_v3.
+-        const int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
++        int flags = (i >= n_layer) ? mtp_flags : trunk_flags;
++        if (segmented) {
++            if (i >= n_layer) {
++                flags = seg_last ? mtp_flags : seg_skip;
++            } else {
++                flags = (i >= seg_s && i < seg_e) ? 0 : seg_skip;
++            }
++        }
+ 
+         auto & layer = layers[i];
+ 
+@@ -228,8 +268,22 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
+     ggml_tensor * cur;
+     ggml_tensor * inpL;
+ 
++    const int  seg_s    = (int) hparams.seg_layer_start;
++    const int  seg_e    = (int) hparams.seg_layer_end;
++    const bool seg_last = seg_e == (int) n_layer;
++
+     // {n_embd, n_tokens}
+-    inpL = build_inp_embd(model.tok_embd);
++    if (seg_s == 0) {
++        inpL = build_inp_embd(model.tok_embd);
++    } else {
++        // [ntl-segrun] residual stream from the previous segment
++        auto inp_state = std::make_unique<llm_graph_input_ntl_state>(n_embd);
++        inp_state->state = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd, n_tokens);
++        ggml_set_input(inp_state->state);
++        ggml_set_name(inp_state->state, "ntl_state_in");
++        inpL = inp_state->state;
++        res->add_input(std::move(inp_state));
++    }
+ 
+     // inp_pos - contains the positions
+     ggml_tensor * inp_pos = build_inp_pos();
+@@ -241,7 +295,7 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
+     // Difference vs Deepseek 3.2: shared indexer layers reuse the top_k from the previous full indexer layers
+     // See https://huggingface.co/zai-org/GLM-5.2/blob/main/config.json#L30
+     ggml_tensor * prev_top_k = nullptr;
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = seg_s; il < seg_e; ++il) {
+         ggml_tensor * inpSA = inpL;
+ 
+         // norm
+@@ -499,6 +553,17 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
+     }
+     cur = inpL;
+ 
++    if (!seg_last) {
++        // [ntl-segrun] hand the residual stream to the next segment, no head
++        if (inp_out_ids) {
++            cur = ggml_get_rows(ctx0, cur, inp_out_ids);
++        }
++        cb(cur, "ntl_state_out", -1);
++        res->t_embd = cur;
++        ggml_build_forward_expand(gf, cur);
++        return;
++    }
++
+     cur = build_norm(cur, model.output_norm, NULL, LLM_NORM_RMS, -1);
+ 
+     // post-norm hidden state feeds the NextN/MTP draft head
+diff --git a/src/models/glm5-next.cpp b/src/models/glm5-next.cpp
+index 844a327..483a678 100644
+--- a/src/models/glm5-next.cpp
++++ b/src/models/glm5-next.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ #include "llama-memory-hybrid-idx.h"
++#include "ntl-segment.h"
+ 
+ // GLM5-Next (GLM-5.3-Flash): hybrid KDA (linear) + nope MLA with a k-pool DSA indexer,
+ // mHC residual streams, DeepSeek-style MoE.
+@@ -52,6 +53,41 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+     GGML_ASSERT(hparams.dsv4_hc_mult == 4 && "mHC with hc_mult != 4 is not supported");
+ 
++    // [ntl-segrun] layer-segment GGUF: only trunk layers [start, end) are present.
++    // A segment that does not start at layer 0 takes the hc residual stream [hc*n_embd] per token as input,
++    // a segment that does not end at n_layer returns it as its (per-token) embeddings.
++    {
++        uint32_t s = 0;
++        uint32_t e = 0;
++        ml.get_key(std::string("ntl.layer_start"), s, false);
++        ml.get_key(std::string("ntl.layer_end"),   e, false);
++        if (e == 0 || e > hparams.n_layer()) {
++            e = hparams.n_layer();
++        }
++        GGML_ASSERT(s < e && "ntl segment: empty layer range");
++        hparams.seg_layer_start = s;
++        hparams.seg_layer_end   = e;
++        // the hybrid memory inputs (recurrent state and MLA cache) must be used by the graph, or they are left
++        // without a buffer: every segment needs at least one layer of each kind
++        bool has_recr = false;
++        bool has_attn = false;
++        for (uint32_t il = s; il < e; ++il) {
++            (hparams.is_recr(il) ? has_recr : has_attn) = true;
++        }
++        GGML_ASSERT(has_recr && has_attn && "ntl segment: the layer range needs at least one KDA and one MLA layer");
++        const uint32_t n_state = hparams.dsv4_hc_mult * hparams.n_embd;
++        if (s > 0) {
++            hparams.n_embd_inp_impl = n_state;
++        }
++        if (e < hparams.n_layer()) {
++            hparams.n_embd_out_impl = n_state;
++        }
++        if (s > 0 || e < hparams.n_layer()) {
++            LLAMA_LOG_INFO("%s: ntl segment: trunk layers [%u, %u) of %u, state width %u\n",
++                    __func__, s, e, hparams.n_layer(), n_state);
++        }
++    }
++
+     switch (hparams.n_layer()) {
+         case 45: type = LLM_TYPE_320B_A18B; break; // GLM-5.3-Flash
+         default: type = LLM_TYPE_UNKNOWN;
+@@ -68,16 +104,33 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
+     const int trunk_flags = nf.trunk;
+     const int mtp_flags   = nf.mtp;
+ 
+-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
++    // [ntl-segrun] tensors outside the segment are skipped (or simply absent from a segment file)
++    const int  seg_s     = (int) hparams.seg_layer_start;
++    const int  seg_e     = (int) hparams.seg_layer_end;
++    const bool seg_first = seg_s == 0;
++    const bool seg_last  = seg_e == n_layer;
++    const bool segmented = !seg_first || !seg_last;
++    const int  seg_skip  = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
+ 
+-    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+-    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
++    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, seg_first ? 0 : seg_skip);
++
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, seg_last ? 0 : seg_skip);
++    output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, seg_last ? 0 : seg_skip);
+ 
+     for (int i = 0; i < n_layer_all; ++i) {
+         auto & layer = layers[i];
+ 
+         const bool is_nextn = i >= n_layer;
+-        const int flags = is_nextn ? mtp_flags : trunk_flags;
++        int flags = is_nextn ? mtp_flags : trunk_flags;
++        if (segmented) {
++            if (is_nextn) {
++                // the NextN block hangs off the last trunk layer
++                flags = seg_last ? mtp_flags : seg_skip;
++            } else {
++                // a segment file never holds layer 0, so the MTP-only probe in nextn_flags() does not apply
++                flags = (i >= seg_s && i < seg_e) ? 0 : seg_skip;
++            }
++        }
+ 
+         layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, flags);
+         layer.ffn_norm  = create_tensor(tn(LLM_TENSOR_FFN_NORM,  "weight", i), {n_embd}, flags);
+@@ -97,7 +150,7 @@ void llama_model_glm5_next::load_arch_tensors(llama_model_loader & ml) {
+ 
+         if (hparams.is_recr(i)) {
+             auto conv = [&](llm_tensor tid) {
+-                ggml_tensor * t = create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner, 1}, TENSOR_NOT_REQUIRED);
++                ggml_tensor * t = create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner, 1}, TENSOR_NOT_REQUIRED | (flags & TENSOR_SKIP));
+                 return t ? t : create_tensor(tn(tid, "weight", i), {d_conv, 1, d_inner}, flags);
+             };
+             layer.ssm_q_conv = conv(LLM_TENSOR_SSM_CONV1D_Q);
+@@ -661,8 +714,23 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+ 
+     ggml_tensor * cur;
+ 
+-    ggml_tensor * inp = build_inp_embd(model.tok_embd);
+-    cb(inp, "inp_embd", -1);
++    const int  seg_s     = (int) hparams.seg_layer_start;
++    const int  seg_e     = (int) hparams.seg_layer_end;
++    const bool seg_first = seg_s == 0;
++    const bool seg_last  = seg_e == (int) n_layer;
++
++    ggml_tensor * inp = nullptr;
++    if (seg_first) {
++        inp = build_inp_embd(model.tok_embd);
++        cb(inp, "inp_embd", -1);
++    } else {
++        auto inp_state = std::make_unique<llm_graph_input_ntl_state>(hparams.n_embd_inp());
++        inp_state->state = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
++        ggml_set_input(inp_state->state);
++        ggml_set_name(inp_state->state, "ntl_state_in");
++        inp = inp_state->state;
++        res->add_input(std::move(inp_state));
++    }
+ 
+     // recurrent state + K-only MLA cache through the generic hybrid input, plus the indexer cache
+     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(mctx);
+@@ -686,13 +754,18 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+ 
+     const int64_t hc = hparams.dsv4_hc_mult;
+-    ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
+-    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    ggml_tensor * inpL;
++    if (seg_first) {
++        inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
++        inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
++    } else {
++        inpL = ggml_reshape_3d(ctx0, inp, n_embd, hc, n_tokens);
++    }
+     cb(inpL, "hc_init", -1);
+ 
+     ggml_tensor * prev_sel = nullptr;
+ 
+-    for (int il = 0; il < n_layer; ++il) {
++    for (int il = seg_s; il < seg_e; ++il) {
+         const auto & layer = model.layers[il];
+ 
+         ggml_tensor * residual = inpL;
+@@ -761,6 +834,18 @@ llama_model_glm5_next::graph::graph(const llm_graph_params & params) :
+         cb(inpL, "l_out", il);
+     }
+ 
++    if (!seg_last) {
++        // [ntl-segrun] hand the hc residual stream to the next segment, no head
++        ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
++        if (inp_out_ids) {
++            flat = ggml_get_rows(ctx0, flat, inp_out_ids);
++        }
++        cb(flat, "ntl_state_out", -1);
++        res->t_embd = flat;
++        ggml_build_forward_expand(gf, flat);
++        return;
++    }
++
+     // narrow to the output tokens, then collapse the streams
+     // Unmasked nextn embeddings need all rows.
+     if (crop_before_nextn(inp_out_ids)) {
+diff --git a/src/models/ntl-segment.h b/src/models/ntl-segment.h
+new file mode 100644
+index 0000000..2e2dea8
+--- /dev/null
++++ b/src/models/ntl-segment.h
+@@ -0,0 +1,27 @@
++#pragma once
++// [ntl-segrun] shared bits of the layer-segment patch (glm5-next, glm-dsa)
++
++#include "llama-graph.h"
++#include "llama-batch.h"
++
++#include "ggml-backend.h"
++
++// residual stream fed from ubatch.embd, [n_state, n_tokens] (n_state = hc*n_embd for glm5-next, n_embd for glm-dsa)
++class llm_graph_input_ntl_state : public llm_graph_input_i {
++public:
++    llm_graph_input_ntl_state(int64_t n_state) : n_state(n_state) {}
++
++    void set_input(const llama_ubatch * ubatch) override {
++        GGML_ASSERT(ubatch->embd && !ubatch->token && "ntl segment: this segment takes the hc state (batch.embd), not tokens");
++        ggml_backend_tensor_set(state, ubatch->embd, 0, ubatch->n_tokens*n_state*ggml_element_size(state));
++    }
++
++    bool can_reuse(const llm_graph_params & params) override {
++        return state->ne[1] == params.ubatch.n_tokens;
++    }
++
++    ggml_tensor * state = nullptr; // F32 [hc*n_embd, n_tokens]
++
++    const int64_t n_state;
++};
++
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+index 1f4c8a4..8f66d14 100644
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -315,6 +315,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         n_embd = 128;
+         n_head = 16;
+         n_ff   = 192;
++        // [ntl-segrun] 8 layers with the real KDA/MLA pattern (MLA every 4th layer) to test layer segments
++        if (getenv("NTL_TEST_GLM5_NLAYER")) {
++            n_layer = atoi(getenv("NTL_TEST_GLM5_NLAYER"));
++        }
+     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+         n_layer = 3;
+     } else if (arch == LLM_ARCH_METIS16) {
+@@ -340,6 +344,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+         n_head_kv = 2;
+         n_layer   = 4;
+     }
++    if (arch == LLM_ARCH_GLM_DSA && getenv("NTL_TEST_GLM5_NLAYER")) {
++        n_layer = atoi(getenv("NTL_TEST_GLM5_NLAYER")); // [ntl-segrun] layer segments test
++    }
+     n_layer = std::max(n_layer, n_layer_min);
+     const uint32_t n_embd_head = n_embd / n_head;
+ 
+@@ -391,6 +398,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+             for (uint32_t & n : n_head_per_layer) {
+                 n = std::min(n, uint32_t(1));
+             }
++            if (getenv("NTL_TEST_GLM5_NLAYER")) {
++                for (uint32_t il = 0; il < n_layer; il++) {
++                    n_head_per_layer[il] = (il % 4 == 3 || il == n_layer - 1) ? 1 : 0;
++                }
++            }
+         } else {
+             ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+         }
+@@ -564,7 +576,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const
+     // note: using a realistic top-k here makes the results unstable and hard to match between CPU and GPU
+     //       a large value makes things deterministic since all data is selected by the indexer
+     //ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(8));
+-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(131072));
++    // [ntl-segrun] NTL_TEST_INDEXER_TOPK: a top-k below the number of KV cells (unified cache, several texts)
++    ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        uint32_t(getenv("NTL_TEST_INDEXER_TOPK") ? atoi(getenv("NTL_TEST_INDEXER_TOPK")) : 131072));
+ 
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   uint32_t(4));
+     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,        uint32_t(4));
+diff --git a/tools/CMakeLists.txt b/tools/CMakeLists.txt
+index 6a6592c..f025a38 100644
+--- a/tools/CMakeLists.txt
++++ b/tools/CMakeLists.txt
+@@ -27,6 +27,7 @@ else()
+         add_subdirectory(server)
+     endif()
+     add_subdirectory(tokenize)
++    add_subdirectory(ntl-segrun)
+     add_subdirectory(tts)
+     add_subdirectory(mtmd)
+     if (GGML_RPC)
+diff --git a/tools/ntl-segrun/CMakeLists.txt b/tools/ntl-segrun/CMakeLists.txt
+new file mode 100644
+index 0000000..b7ccb58
+--- /dev/null
++++ b/tools/ntl-segrun/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(TARGET ntl-segrun)
++add_executable(${TARGET} ntl-segrun.cpp)
++target_link_libraries(${TARGET} PRIVATE llama ggml ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/tools/ntl-segrun/ntl-segrun.cpp b/tools/ntl-segrun/ntl-segrun.cpp
+new file mode 100644
+index 0000000..4ec6848
+--- /dev/null
++++ b/tools/ntl-segrun/ntl-segrun.cpp
+@@ -0,0 +1,637 @@
++// ntl-segrun: run a GLM5-Next model one layer segment at a time (Name That LLM, private fork).
++//
++// The model is too large for the machine, so it ships as layer-range GGUF segments
++// (keys ntl.layer_start / ntl.layer_end). Every text goes through segment k before segment k+1 is
++// loaded, so each weight is read once. Between segments the hc residual stream (hc*n_embd floats per
++// token) is kept in a state file. The last segment scores the text tokens.
++//
++//   ntl-segrun tokenize --model SEG0 --texts texts.bin --out tok.bin [--prefix STR] [--suffix STR] [--max-text-tokens N]
++//   ntl-segrun run      --model SEG  --tokens tok.bin [--state-in S] --out OUT
++//                       [--state-dtype f16|bf16|f32] [--ngl N] [--split-mid] [--threads N] [--seq-batch B] [--limit N]
++//                       [--pack] [--ubatch-div P]
++//
++// --pack: each llama_decode holds up to 2B texts and B*(max_len+1) tokens; every text is padded at its end to the
++//         longest text of the batch + 1 (padding rows are not outputs and come after the real ones, so causality
++//         keeps them out of every real row), and the KV cache is unified. With texts sorted by length this gives
++//         big equal-length ubatches (split_equal / split_simple) instead of one ubatch per text (split_seq).
++// --ubatch-div P: n_ubatch = n_batch / P, so with --split-mid the two GPUs work on consecutive ubatches at the
++//         same time (llama.cpp pipeline parallelism).
++//
++// Files (little endian):
++//   texts.bin : "NTLT" u32 n, then n x { u32 nbytes, bytes }
++//   tok.bin   : "NTLK" u32 n, then n x { u32 n_tok, u32 n_prefix, i32 ids[n_tok] }
++//   state     : "NTLS" u32 dtype(0 f32, 1 f16, 2 bf16) u32 width u32 n_texts u64 n_rows, rows of all texts in order
++//   scores    : "NTLP" u32 n_texts u32 n_fields(=4), then n_texts x { u32 n_scored, f32 [n_scored][4] }
++//               fields per scored token: logprob of the true token, entropy, E_p[logp^2], rank (0 = top-1)
++//
++// The tokens scored are the text tokens: positions n_prefix .. n_tok-1, each from the output at the
++// position before it.
++
++#include "llama.h"
++#include "ggml.h"
++
++#include <cinttypes>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <chrono>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct text_tokens {
++    uint32_t n_prefix = 0;
++    std::vector<llama_token> ids;
++};
++
++static void die(const char * msg) {
++    fprintf(stderr, "ntl-segrun: error: %s\n", msg);
++    exit(1);
++}
++
++static FILE * xopen(const std::string & path, const char * mode) {
++    FILE * f = fopen(path.c_str(), mode);
++    if (!f) {
++        fprintf(stderr, "ntl-segrun: cannot open %s\n", path.c_str());
++        exit(1);
++    }
++    return f;
++}
++
++static void xread(void * dst, size_t n, FILE * f) {
++    if (n && fread(dst, 1, n, f) != n) {
++        die("short read");
++    }
++}
++
++static void xwrite(const void * src, size_t n, FILE * f) {
++    if (n && fwrite(src, 1, n, f) != n) {
++        die("short write (disk full?)");
++    }
++}
++
++static void check_magic(FILE * f, const char * magic) {
++    char m[4];
++    xread(m, 4, f);
++    if (memcmp(m, magic, 4) != 0) {
++        fprintf(stderr, "ntl-segrun: bad magic, expected %.4s\n", magic);
++        exit(1);
++    }
++}
++
++static std::vector<std::string> read_texts(const std::string & path) {
++    FILE * f = xopen(path, "rb");
++    check_magic(f, "NTLT");
++    uint32_t n;
++    xread(&n, 4, f);
++    std::vector<std::string> out(n);
++    for (auto & s : out) {
++        uint32_t nb;
++        xread(&nb, 4, f);
++        s.resize(nb);
++        xread(s.data(), nb, f);
++    }
++    fclose(f);
++    return out;
++}
++
++static std::vector<text_tokens> read_tokens(const std::string & path) {
++    FILE * f = xopen(path, "rb");
++    check_magic(f, "NTLK");
++    uint32_t n;
++    xread(&n, 4, f);
++    std::vector<text_tokens> out(n);
++    for (auto & t : out) {
++        uint32_t nt;
++        xread(&nt, 4, f);
++        xread(&t.n_prefix, 4, f);
++        t.ids.resize(nt);
++        xread(t.ids.data(), 4*(size_t) nt, f);
++    }
++    fclose(f);
++    return out;
++}
++
++static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::string & s, bool special) {
++    if (s.empty()) {
++        return {};
++    }
++    int n = -llama_tokenize(vocab, s.data(), (int) s.size(), nullptr, 0, false, special);
++    if (n <= 0) {
++        n = (int) s.size() + 8;
++    }
++    std::vector<llama_token> out(n);
++    const int got = llama_tokenize(vocab, s.data(), (int) s.size(), out.data(), n, false, special);
++    if (got < 0) {
++        die("tokenize failed");
++    }
++    out.resize(got);
++    return out;
++}
++
++// ---------------------------------------------------------------------------------------------
++// state rows
++
++enum state_dtype : uint32_t { ST_F32 = 0, ST_F16 = 1, ST_BF16 = 2 };
++
++static size_t st_elsize(uint32_t dt) {
++    return dt == ST_F32 ? 4 : 2;
++}
++
++static double g_state_absmax  = 0.0;
++static size_t g_state_over_f16 = 0;
++
++static void st_from_f32(uint32_t dt, const float * src, void * dst, int64_t n) {
++    for (int64_t i = 0; i < n; ++i) {
++        const double a = std::fabs((double) src[i]);
++        if (!(a <= 6.0e4)) { // also catches NaN
++            g_state_over_f16++;
++        }
++        if (a > g_state_absmax) {
++            g_state_absmax = a;
++        }
++    }
++    switch (dt) {
++        case ST_F32:  memcpy(dst, src, n*sizeof(float)); break;
++        case ST_F16:  ggml_fp32_to_fp16_row(src, (ggml_fp16_t *) dst, n); break;
++        case ST_BF16: ggml_fp32_to_bf16_row(src, (ggml_bf16_t *) dst, n); break;
++        default: die("bad state dtype");
++    }
++}
++
++static void st_to_f32(uint32_t dt, const void * src, float * dst, int64_t n) {
++    switch (dt) {
++        case ST_F32:  memcpy(dst, src, n*sizeof(float)); break;
++        case ST_F16:  ggml_fp16_to_fp32_row((const ggml_fp16_t *) src, dst, n); break;
++        case ST_BF16: ggml_bf16_to_fp32_row((const ggml_bf16_t *) src, dst, n); break;
++        default: die("bad state dtype");
++    }
++}
++
++// ---------------------------------------------------------------------------------------------
++
++struct args_t {
++    std::string cmd;
++    std::string model;
++    std::string texts;
++    std::string tokens;
++    std::string state_in;
++    std::string out;
++    std::string prefix;
++    std::string suffix;
++    std::string state_dtype = "f16";
++    int max_text_tokens = 256;
++    int ngl = 999;
++    int threads = 4;
++    int seq_batch = 1;
++    int limit = -1;
++    bool split_mid = false;
++    bool pack = false;
++    int ubatch_div = 1;
++};
++
++static args_t parse_args(int argc, char ** argv) {
++    args_t a;
++    if (argc < 2) {
++        die("usage: ntl-segrun tokenize|run [options] (see the header of ntl-segrun.cpp)");
++    }
++    a.cmd = argv[1];
++    for (int i = 2; i < argc; ++i) {
++        const std::string k = argv[i];
++        auto val = [&]() -> std::string {
++            if (i + 1 >= argc) {
++                fprintf(stderr, "ntl-segrun: missing value for %s\n", k.c_str());
++                exit(1);
++            }
++            return argv[++i];
++        };
++        if      (k == "--model")           a.model = val();
++        else if (k == "--texts")           a.texts = val();
++        else if (k == "--tokens")          a.tokens = val();
++        else if (k == "--state-in")        a.state_in = val();
++        else if (k == "--out")             a.out = val();
++        else if (k == "--prefix")          a.prefix = val();
++        else if (k == "--suffix")          a.suffix = val();
++        else if (k == "--state-dtype")     a.state_dtype = val();
++        else if (k == "--max-text-tokens") a.max_text_tokens = atoi(val().c_str());
++        else if (k == "--ngl")             a.ngl = atoi(val().c_str());
++        else if (k == "--threads")         a.threads = atoi(val().c_str());
++        else if (k == "--seq-batch")       a.seq_batch = atoi(val().c_str());
++        else if (k == "--limit")           a.limit = atoi(val().c_str());
++        else if (k == "--split-mid")       a.split_mid = true;
++        else if (k == "--pack")            a.pack = true;
++        else if (k == "--ubatch-div")      a.ubatch_div = atoi(val().c_str());
++        else {
++            fprintf(stderr, "ntl-segrun: unknown option %s\n", k.c_str());
++            exit(1);
++        }
++    }
++    return a;
++}
++
++static int cmd_tokenize(const args_t & a) {
++    llama_model_params mp = llama_model_default_params();
++    mp.vocab_only = true;
++    llama_model * model = llama_model_load_from_file(a.model.c_str(), mp);
++    if (!model) {
++        die("cannot load vocab");
++    }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++
++    const auto texts  = read_texts(a.texts);
++    const auto prefix = tokenize(vocab, a.prefix, true);
++    const auto suffix = tokenize(vocab, a.suffix, true);
++    if (prefix.empty()) {
++        die("--prefix must produce at least one token (the first text token is scored from the last prefix position)");
++    }
++
++    FILE * f = xopen(a.out, "wb");
++    xwrite("NTLK", 4, f);
++    const uint32_t n = texts.size();
++    xwrite(&n, 4, f);
++    size_t n_total = 0;
++    size_t n_cut   = 0;
++    for (const auto & s : texts) {
++        auto body = tokenize(vocab, s, false);
++        if ((int) body.size() > a.max_text_tokens) {
++            body.resize(a.max_text_tokens);
++            n_cut++;
++        }
++        std::vector<llama_token> ids = prefix;
++        ids.insert(ids.end(), body.begin(), body.end());
++        ids.insert(ids.end(), suffix.begin(), suffix.end());
++        const uint32_t nt = ids.size();
++        const uint32_t np = prefix.size();
++        xwrite(&nt, 4, f);
++        xwrite(&np, 4, f);
++        xwrite(ids.data(), 4*(size_t) nt, f);
++        n_total += nt;
++    }
++    fclose(f);
++    fprintf(stderr, "ntl-segrun: tokenized %u texts, %zu tokens (prefix %zu, suffix %zu), %zu cut to %d text tokens\n",
++            n, n_total, prefix.size(), suffix.size(), n_cut, a.max_text_tokens);
++    llama_model_free(model);
++    return 0;
++}
++
++static int cmd_run(const args_t & a) {
++    const auto t0 = std::chrono::steady_clock::now();
++
++    auto texts = read_tokens(a.tokens);
++    if (a.limit >= 0 && (size_t) a.limit < texts.size()) {
++        texts.resize(a.limit);
++    }
++    const uint32_t n_texts = texts.size();
++    size_t n_rows_total = 0;
++    uint32_t max_len = 0;
++    for (const auto & t : texts) {
++        n_rows_total += t.ids.size();
++        max_len = std::max<uint32_t>(max_len, t.ids.size());
++    }
++
++    llama_backend_init();
++
++    // probe the segment range with a vocab-only load would not give n_embd_inp, so load once with the real params
++    llama_model_params mp = llama_model_default_params();
++    mp.n_gpu_layers = a.ngl;
++    mp.load_mtp     = false;
++
++    std::vector<float> tsplit;
++    if (a.split_mid) {
++        // put the boundary between the two GPUs in the middle of the segment's layers
++        llama_model_params mpv = llama_model_default_params();
++        mpv.vocab_only = true;
++        llama_model * mv = llama_model_load_from_file(a.model.c_str(), mpv);
++        if (!mv) {
++            die("cannot read segment metadata");
++        }
++        // a vocab-only load does not fill the hparams (llama_model_n_layer() is 0 there): read the metadata.
++        // llama_model::load_tensors maps layer il to a device by il / (n_layer_all + 1), where
++        // n_layer_all = <arch>.block_count (trunk + nextn layers) and the last slot is the output layer.
++        char buf[64];
++        char arch[64] = {0};
++        if (llama_model_meta_val_str(mv, "general.architecture", arch, sizeof(arch)) <= 0) {
++            die("split-mid: no general.architecture");
++        }
++        if (llama_model_meta_val_str(mv, (std::string(arch) + ".block_count").c_str(), buf, sizeof(buf)) <= 0) {
++            die("split-mid: no <arch>.block_count");
++        }
++        const int n_layer_all = atoi(buf);
++        int n_nextn = 0;
++        if (llama_model_meta_val_str(mv, (std::string(arch) + ".nextn_predict_layers").c_str(), buf, sizeof(buf)) > 0) {
++            n_nextn = atoi(buf);
++        }
++        int s = 0;
++        int e = n_layer_all - n_nextn;
++        if (llama_model_meta_val_str(mv, "ntl.layer_start", buf, sizeof(buf)) > 0) { s = atoi(buf); }
++        if (llama_model_meta_val_str(mv, "ntl.layer_end",   buf, sizeof(buf)) > 0) { e = atoi(buf); }
++        const int n_slots = n_layer_all + 1;
++        llama_model_free(mv);
++        if (!(0 <= s && s < e && e <= n_layer_all)) {
++            die("split-mid: bad layer range");
++        }
++        const int m = s + (e - s + 1)/2;
++        const float f0 = (m - 0.5f)/n_slots;
++        tsplit = { f0, 1.0f - f0 };
++        tsplit.resize(128, 0.0f);
++        mp.tensor_split = tsplit.data();
++        fprintf(stderr, "ntl-segrun: split-mid: layers [%d, %d) -> boundary at layer %d (f0 = %.4f, slots %d)\n", s, e, m, f0, n_slots);
++        if (!(f0 > 0.0f && f0 < 1.0f)) {
++            die("split-mid: split fraction out of (0, 1)");
++        }
++    }
++
++    llama_model * model = llama_model_load_from_file(a.model.c_str(), mp);
++    if (!model) {
++        die("cannot load model");
++    }
++    const auto t_loaded = std::chrono::steady_clock::now();
++
++    const int n_embd     = llama_model_n_embd(model);
++    const int n_embd_inp = llama_model_n_embd_inp(model);
++    const int n_embd_out = llama_model_n_embd_out(model);
++    // the segment range comes from the metadata (glm-dsa keeps the same width for tokens and states)
++    int seg_s = 0;
++    int seg_e = llama_model_n_layer(model);
++    {
++        char buf[64];
++        if (llama_model_meta_val_str(model, "ntl.layer_start", buf, sizeof(buf)) > 0) { seg_s = atoi(buf); }
++        if (llama_model_meta_val_str(model, "ntl.layer_end",   buf, sizeof(buf)) > 0) { seg_e = atoi(buf); }
++    }
++    const bool state_input  = seg_s > 0;
++    const bool state_output = seg_e < llama_model_n_layer(model);
++    fprintf(stderr, "ntl-segrun: segment layers [%d, %d) of %d\n", seg_s, seg_e, llama_model_n_layer(model));
++    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
++
++    fprintf(stderr, "ntl-segrun: %u texts, %zu rows, max len %u; n_embd %d, in %s (%d), out %s (%d), n_vocab %d\n",
++            n_texts, n_rows_total, max_len, n_embd,
++            state_input ? "state" : "tokens", n_embd_inp,
++            state_output ? "state" : "scores", n_embd_out, n_vocab);
++
++    const int B = std::max(1, a.seq_batch);
++
++    // tokens per llama_decode (and KV cells); texts per llama_decode
++    const uint32_t budget  = a.pack ? (uint32_t) B * (max_len + 1) : (uint32_t) B * max_len;
++    const int      max_seq = a.pack ? std::min(64, 2*B) : B;
++    const int      udiv    = std::max(1, a.ubatch_div);
++
++    llama_context_params cp = llama_context_default_params();
++    cp.n_ctx           = budget;
++    cp.n_batch         = budget;
++    cp.n_ubatch        = (budget + udiv - 1) / udiv;
++    cp.n_seq_max       = max_seq;
++    cp.kv_unified      = a.pack;
++    cp.n_threads       = a.threads;
++    cp.n_threads_batch = a.threads;
++    cp.embeddings      = state_output;
++    cp.pooling_type    = LLAMA_POOLING_TYPE_NONE;
++    cp.no_perf         = true;
++
++    llama_context * ctx = llama_init_from_model(model, cp);
++    if (!ctx) {
++        die("cannot create context");
++    }
++    // from here on the output (maybe the input state itself, in place) is written: the driver retries smaller
++    // batches only for failures before this line
++    fprintf(stderr, "ntl-segrun: context ready (seq-batch %d, n_ctx %u, n_ubatch %u, max seqs %d, pack %d)\n",
++            B, cp.n_ctx, cp.n_ubatch, max_seq, (int) a.pack);
++
++    // input state
++    FILE * fin = nullptr;
++    uint32_t in_dt = ST_F32;
++    if (state_input) {
++        if (a.state_in.empty()) {
++            die("this segment takes the hc state: pass --state-in");
++        }
++        fin = xopen(a.state_in, "rb");
++        check_magic(fin, "NTLS");
++        uint32_t w, nt;
++        uint64_t nr;
++        xread(&in_dt, 4, fin);
++        xread(&w, 4, fin);
++        xread(&nt, 4, fin);
++        xread(&nr, 8, fin);
++        if ((int) w != n_embd_inp) {
++            die("state width does not match the segment");
++        }
++        if (nt < n_texts) {
++            die("state file holds fewer texts than requested");
++        }
++    }
++
++    // output
++    uint32_t out_dt = ST_F16;
++    if (a.state_dtype == "f32") out_dt = ST_F32;
++    else if (a.state_dtype == "bf16") out_dt = ST_BF16;
++    else if (a.state_dtype != "f16") die("--state-dtype must be f16, bf16 or f32");
++    // --out == --state-in: the state is rewritten in place (every text's rows are read before they are overwritten),
++    // which halves the disk needed between segments
++    const bool inplace = state_input && state_output && a.out == a.state_in;
++    if (inplace && (out_dt != in_dt || n_embd_out != n_embd_inp)) {
++        die("in-place state needs the same --state-dtype and width as the input state");
++    }
++    FILE * fout = xopen(a.out, inplace ? "r+b" : "wb");
++    if (state_output) {
++        xwrite("NTLS", 4, fout);
++        const uint64_t nr = n_rows_total;
++        xwrite(&out_dt, 4, fout);
++        xwrite(&n_embd_out, 4, fout);
++        xwrite(&n_texts, 4, fout);
++        xwrite(&nr, 8, fout);
++    } else {
++        xwrite("NTLP", 4, fout);
++        const uint32_t nf = 4;
++        xwrite(&n_texts, 4, fout);
++        xwrite(&nf, 4, fout);
++    }
++
++    llama_batch batch = llama_batch_init((int32_t) budget, state_input ? n_embd_inp : 0, max_seq);
++
++    std::vector<uint8_t> rowbuf;
++    std::vector<float>   row32;
++    std::vector<float>   scores;
++    llama_memory_t mem = llama_get_memory(ctx);
++
++    size_t done_rows = 0;
++    size_t pad_rows  = 0;
++    uint32_t next_report = 200;
++    std::vector<int> first_row; // batch index of the first row of each text of the batch
++    for (uint32_t i0 = 0; i0 < n_texts; ) {
++        // the texts of this decode and the padded length
++        uint32_t i1 = i0;
++        int padlen = 0;
++        if (a.pack) {
++            while (i1 < n_texts && (int) (i1 - i0) < max_seq) {
++                const int L = std::max<int>(padlen, (int) texts[i1].ids.size() + 1);
++                if (i1 > i0 && (size_t) L * (i1 - i0 + 1) > budget) {
++                    break;
++                }
++                padlen = L;
++                ++i1;
++            }
++        } else {
++            i1 = std::min<uint32_t>(n_texts, i0 + B);
++        }
++
++        llama_memory_clear(mem, true);
++
++        batch.n_tokens = 0;
++        first_row.clear();
++        for (uint32_t i = i0; i < i1; ++i) {
++            const auto & t = texts[i];
++            const int nt = t.ids.size();
++            const int np = a.pack ? padlen : nt; // rows of this text in the batch (real + padding)
++            const llama_seq_id sid = i - i0;
++            const size_t rb = (size_t) n_embd_inp * st_elsize(in_dt);
++            if (state_input) {
++                rowbuf.resize(rb * nt);
++                xread(rowbuf.data(), rowbuf.size(), fin);
++            }
++            first_row.push_back(batch.n_tokens);
++            for (int j = 0; j < np; ++j) {
++                const int k = batch.n_tokens++;
++                const bool real = j < nt;
++                const int jr = real ? j : nt - 1; // padding repeats the last real row (token or state)
++                if (state_input) {
++                    st_to_f32(in_dt, rowbuf.data() + (size_t) jr*rb, batch.embd + (size_t) k*n_embd_inp, n_embd_inp);
++                } else {
++                    batch.token[k] = t.ids[jr];
++                }
++                batch.pos[k]       = j;
++                batch.n_seq_id[k]  = 1;
++                batch.seq_id[k][0] = sid;
++                // states: every real row; scores: the rows that predict a text token
++                batch.logits[k]    = real && (state_output ? true : (j >= (int) t.n_prefix - 1 && j < nt - 1));
++            }
++            pad_rows += np - nt;
++        }
++        GGML_ASSERT((uint32_t) batch.n_tokens <= budget);
++
++        const int ret = llama_decode(ctx, batch);
++        if (ret != 0) {
++            fprintf(stderr, "ntl-segrun: llama_decode failed (%d) at text %u\n", ret, i0);
++            exit(1);
++        }
++
++        for (uint32_t i = i0; i < i1; ++i) {
++            const auto & t = texts[i];
++            const int nt = t.ids.size();
++            int k = first_row[i - i0];
++            if (state_output) {
++                rowbuf.resize((size_t) n_embd_out * st_elsize(out_dt));
++                for (int j = 0; j < nt; ++j, ++k) {
++                    const float * e = llama_get_embeddings_ith(ctx, k);
++                    if (!e) {
++                        die("no embeddings for row");
++                    }
++                    st_from_f32(out_dt, e, rowbuf.data(), n_embd_out);
++                    xwrite(rowbuf.data(), rowbuf.size(), fout);
++                }
++            } else {
++                const uint32_t n_scored = nt - t.n_prefix;
++                scores.assign((size_t) n_scored*4, 0.0f);
++                // the rows of this text that predict a text token: batch row k + j predicts ids[j + 1]
++                const int k0 = k;
++                const int j0 = (int) t.n_prefix - 1;
++                // llama_get_logits_ith syncs and reorders the outputs on first use: not thread safe, fetch the rows here
++                std::vector<const float *> rows(n_scored);
++                for (int q = 0; q < (int) n_scored; ++q) {
++                    rows[q] = llama_get_logits_ith(ctx, k0 + j0 + q);
++                    if (!rows[q]) {
++                        die("no logits for row");
++                    }
++                }
++                const int nthr = std::max(1, std::min<int>(a.threads, (int) n_scored));
++                std::vector<std::thread> pool;
++                for (int w = 0; w < nthr; ++w) {
++                    pool.emplace_back([&, w]() {
++                        for (int q = w; q < (int) n_scored; q += nthr) {
++                            const int j = j0 + q;
++                            const float * l = rows[q];
++                            const float ly = l[t.ids[j + 1]];
++                            // pass 1: max and rank; pass 2 (one exp per entry): with d = l - max,
++                            // z = sum e^d, s1 = sum e^d d, s2 = sum e^d d^2, and logp = d - log z:
++                            // H = log z - s1/z, E[logp^2] = s2/z - 2 log z s1/z + (log z)^2
++                            float mx = -INFINITY;
++                            int rank = 0;
++                            for (int v = 0; v < n_vocab; ++v) {
++                                mx = std::max(mx, l[v]);
++                                rank += l[v] > ly;
++                            }
++                            double z = 0.0, s1 = 0.0, s2 = 0.0;
++                            constexpr int BLK = 1024;
++                            for (int v0 = 0; v0 < n_vocab; v0 += BLK) {
++                                const int v1 = std::min(n_vocab, v0 + BLK);
++                                float bz = 0.0f, b1 = 0.0f, b2 = 0.0f;
++                                for (int v = v0; v < v1; ++v) {
++                                    const float d = l[v] - mx;
++                                    const float e = expf(d);
++                                    bz += e;
++                                    b1 += e*d;
++                                    b2 += e*d*d;
++                                }
++                                z += bz; s1 += b1; s2 += b2;
++                            }
++                            const double lz = std::log(z);
++                            const double e1 = s1/z;
++                            float * o = scores.data() + (size_t) q*4;
++                            o[0] = (float) (ly - mx - lz);
++                            o[1] = (float) (lz - e1);
++                            o[2] = (float) (s2/z - 2.0*lz*e1 + lz*lz);
++                            o[3] = (float) rank;
++                        }
++                    });
++                }
++                for (auto & th : pool) {
++                    th.join();
++                }
++                xwrite(&n_scored, 4, fout);
++                xwrite(scores.data(), scores.size()*sizeof(float), fout);
++            }
++            done_rows += nt;
++        }
++
++        if (i1 >= next_report || i1 == n_texts) {
++            const double el = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_loaded).count();
++            fprintf(stderr, "ntl-segrun: %u/%u texts, %zu rows (+%zu padding), %.1f s, %.0f rows/s\n",
++                    i1, n_texts, done_rows, pad_rows, el, done_rows/std::max(el, 1e-9));
++            while (next_report <= i1) next_report += 200;
++        }
++        i0 = i1;
++    }
++
++    fclose(fout);
++    if (fin) {
++        fclose(fin);
++    }
++    llama_batch_free(batch);
++    llama_free(ctx);
++    llama_model_free(model);
++    llama_backend_free();
++
++    if (state_output) {
++        fprintf(stderr, "ntl-segrun: state max |x| = %.1f, values beyond f16 range (or NaN): %zu\n", g_state_absmax, g_state_over_f16);
++        if (g_state_over_f16 > 0 && out_dt == ST_F16) {
++            fprintf(stderr, "ntl-segrun: WARNING: the f16 state overflowed, rerun with --state-dtype bf16 or f32\n");
++        }
++    }
++
++    const auto t1 = std::chrono::steady_clock::now();
++    fprintf(stderr, "ntl-segrun: done. load %.1f s, compute %.1f s\n",
++            std::chrono::duration<double>(t_loaded - t0).count(),
++            std::chrono::duration<double>(t1 - t_loaded).count());
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    const args_t a = parse_args(argc, argv);
++    if (a.cmd == "tokenize") {
++        return cmd_tokenize(a);
++    }
++    if (a.cmd == "run") {
++        return cmd_run(a);
++    }
++    die("unknown command (tokenize | run)");
++}

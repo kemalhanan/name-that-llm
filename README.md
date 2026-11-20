@@ -82,6 +82,19 @@ uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=0.25 --lo
 - **Colab:** [notebooks/colab_lora_train_mistral7b_full.ipynb](notebooks/colab_lora_train_mistral7b_full.ipynb) runs the full run on a Colab A100 with `remote_train unattended` ([open in Colab](https://colab.research.google.com/github/kemalhanan/name-that-llm/blob/main/notebooks/colab_lora_train_mistral7b_full.ipynb)). Nothing is written to Google Drive: stage 1 saves every 20 minutes and each fold as it finishes, every save is backed up to a private Kaggle dataset, and a restarted run restores the last backup and continues. Build it for another variant with `uv run python -m name_that_llm.remote_train colab <variant>`.
 - **Colab without a browser tab:** [scripts/colab/](scripts/colab/) starts the same run on a runtime created through the Colab API. `push.py <runtime url> <proxy token>` copies the working tree and your Kaggle token to the runtime, `ensure.sh` reports the run and starts it if it is not running, and `boot.sh` installs and runs it.
 
+GLM-5.3 likelihood features (two of the 18 labels are open-weight models, scored under their real weights with José Padilla's `ntl-segrun`, see [name_that_llm/glm_ll/](name_that_llm/glm_ll/)):
+
+```bash
+uv run python -m name_that_llm.kaggle_glm_features --mode timing
+uv run python -m name_that_llm.kaggle_glm_features --tpu --mode timing
+uv run python -m name_that_llm.modeling.glm_compare <gpu output dir> <tpu output dir>
+uv run python -m name_that_llm.modeling.glm_blend <features dir>
+```
+
+- The first notebook runs on two T4s with the author's CUDA build. The `--tpu` one spends TPU quota instead: llama.cpp cannot use the TPU chips, so it builds `ntl-segrun` for the TPU VM's host CPUs (internet on), checks the build with the author's segmented-vs-whole validation, and runs one thread per core. `probe` mode only checks the machine and the inputs; `SHARD = (k, n)` splits a full run over sessions.
+- `glm_compare` checks that CPU and GPU runs give the same features on the 40 passages both timing runs score, since a submission would score the test on GPUs.
+- `glm_blend` fits the likelihood member fold by fold and reports its gain on the out-of-fold blend.
+
 Each training run writes held-out logits. Compare and blend them with:
 
 ```bash
