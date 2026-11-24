@@ -20,19 +20,21 @@ import joblib
 from loguru import logger
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 import typer
 
 from name_that_llm.config import INTERIM_DATA_DIR, RAW_DATA_DIR, REPORTS_DIR
+from name_that_llm.glm_member import (
+    GLM_LABELS,
+    GLM_TAGS,
+    fit_member,
+    glm_mass,
+    likelihood_frame,
+)
 from name_that_llm.modeling.lora_blend import log_softmax
 from name_that_llm.modeling.postprocess import balanced_accuracy, sinkhorn
 
 app = typer.Typer()
 
-DIFF_FEATURES = ("lp_mean", "lp_q50", "ent_mean", "top1", "logrank_mean", "fdg")
-GLM_LABELS = ("glm-5.3", "glm-5.3-flash")
 # the submitted blend (README): folder with oof_logits.parquet -> weight
 MEMBERS = {
     "lora4b_full": 0.25,
@@ -55,10 +57,7 @@ def read_features(features_dir: Path, tag: str) -> pd.DataFrame:
 
 def likelihood_matrix(features_dir: Path, ids) -> tuple[np.ndarray, list[str]]:
     """Feature matrix in ``ids`` order: both models' features, then the Flash - GLM-5.3 differences."""
-    blocks = [read_features(features_dir, tag).add_prefix(f"{tag}:") for tag in ("flash", "glm53")]
-    frame = pd.concat(blocks, axis=1).reindex([str(i) for i in ids])
-    for c in DIFF_FEATURES:
-        frame[f"d:{c}"] = frame[f"flash:{c}"] - frame[f"glm53:{c}"]
+    frame = likelihood_frame(*(read_features(features_dir, tag) for tag in GLM_TAGS), ids)
     return frame.to_numpy(np.float64), list(frame.columns)
 
 
@@ -67,8 +66,7 @@ def oof_member(x: np.ndarray, y: np.ndarray, fold: np.ndarray, k: int, C: float)
     out = np.zeros((len(y), k))
     for f in np.unique(fold):
         fit, held = fold != f, fold == f
-        model = make_pipeline(StandardScaler(), LogisticRegression(C=C, max_iter=2000))
-        model.fit(x[fit], y[fit])
+        model = fit_member(x[fit], y[fit], C)
         assert len(model.classes_) == k
         out[held] = model.predict_log_proba(x[held])
     return out
@@ -118,7 +116,6 @@ def main(
 
     member = np.zeros((len(y), k))
     member[scored] = oof_member(x[scored], y[scored], fold[scored], k, C)
-    glm_cols = [labels.index(c) for c in GLM_LABELS]
 
     def predict(lp):
         return sinkhorn(np.exp(lp - lp.max(1, keepdims=True)), balance_strength).argmax(1)
@@ -130,7 +127,7 @@ def main(
         return float((pred[y == c] == c).mean())
 
     # passages ranked by the blend's own probability of the two GLM labels, scored ones first
-    mass = np.exp(log_softmax(logp)[:, glm_cols]).sum(1)
+    mass = glm_mass(logp, labels)
     order = np.argsort(-np.where(scored, mass, -1.0), kind="stable")
 
     prompts = train.prompt_id.iloc[idx].to_numpy()

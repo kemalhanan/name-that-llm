@@ -72,6 +72,11 @@ SEGMENT_DATASETS = list(SEGMENTS)
 BINARY_NOTEBOOK = "estopadilla/ntl-glm-likelihood-train"
 # the prompt prefix and the 160-token cut the public likelihood head was fitted with
 PREFIX = "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|><|assistant|><think></think>"
+# the same author's later prefix (prvsiyan's idea, in "0.716 | Robust GLM-5.3 Likelihood + User
+# Prefix"): run_pipeline.py replaces '{user}' per passage with --user-template and its word count
+PREFIX_USER_TURN = (
+    "[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>{user}<|assistant|><think></think>"
+)
 MAX_TEXT_TOKENS = 160
 TIMING_ROWS = 40
 # the author's ntl-segrun sources (glm_ll/segrun/, copied unchanged), checked before they are embedded

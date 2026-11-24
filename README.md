@@ -2,7 +2,7 @@
 
 My solution for the Kaggle code competition [Name That LLM](https://www.kaggle.com/competitions/name-that-llm). The task is to tell which of 18 LLMs wrote a passage of text, scored by balanced accuracy.
 
-**Best public LB: 0.629**. That submission blends a TF-IDF LinearSVC with four LoRA classifiers (Qwen3 4B, 8B and 14B, and Mistral-7B), each trained 5-fold.
+**Best public LB: 0.690**. That submission blends a TF-IDF LinearSVC with four LoRA classifiers (Qwen3 4B, 8B and 14B, and Mistral-7B), each trained 5-fold, and adds a member built on GLM-5.3 likelihoods for the passages the blend most suspects of being GLM, scored with the passage framed as the assistant's reply to a user turn. It also adds CHEN Han's Qwen3-Embedding-8B expert, which reads each passage against the others in its TF-IDF prompt group. Using those groups on the blend itself (centring it within a group, or giving a group's passages different models) gains out-of-fold but lost on the public leaderboard.
 
 ## Approach
 
@@ -35,9 +35,14 @@ All cross-validation is `GroupKFold(5)` by `prompt_id`. Every model answered eve
 | + a 5-fold 4B LoRA trained on a 186k pool sample | 0.589 |
 | SVM + 5-fold 4B (186k) + 5-fold 8B (152k) only | 0.607 |
 | + a 5-fold Mistral-7B LoRA (136k) | 0.611 |
-| **+ a 5-fold Qwen3-14B LoRA (193k)** | **0.629** |
+| + a 5-fold Qwen3-14B LoRA (193k) | 0.629 |
+| + a GLM-5.3 likelihood member on the 20% most GLM-like passages | 0.655 |
+| the same, with the passage scored after a user-turn prefix (OOF 0.6916) | 0.662 |
+| + TF-IDF prompt groups, CHEN Han's Qwen3-Embedding-8B expert and one model per passage within each group (OOF 0.8495) | 0.663 |
+| the same without one model per passage within each group (OOF 0.7391) | 0.684 |
+| **the same without centring the blend within each group (OOF 0.7217)** | **0.690** |
 
-The final blend scores 0.6531 balanced accuracy out-of-fold (0.6361 without the 14B, 0.6305 without the Mistral-7B as well). The best single model is the 5-fold 14B LoRA at 0.630; the 8B scores 0.615, the 4B 0.597 and the Mistral-7B 0.595. Per-run metrics are in [reports/](reports/).
+The final blend scores 0.6831 balanced accuracy out-of-fold, 0.6531 without the GLM member (0.6361 without the 14B as well, 0.6305 without the Mistral-7B too). The best single model is the 5-fold 14B LoRA at 0.630; the 8B scores 0.615, the 4B 0.597 and the Mistral-7B 0.595. Per-run metrics are in [reports/](reports/).
 
 ## Reproducing
 
@@ -93,7 +98,19 @@ uv run python -m name_that_llm.modeling.glm_blend <features dir>
 
 - The first notebook runs on two T4s with the author's CUDA build. The `--tpu` one spends TPU quota instead: llama.cpp cannot use the TPU chips, so it builds `ntl-segrun` for the TPU VM's host CPUs (internet on), checks the build with the author's segmented-vs-whole validation, and runs one thread per core. `probe` mode only checks the machine and the inputs; `SHARD = (k, n)` splits a full run over sessions.
 - `glm_compare` checks that CPU and GPU runs give the same features on the 40 passages both timing runs score, since a submission would score the test on GPUs.
-- `glm_blend` fits the likelihood member fold by fold and reports its gain on the out-of-fold blend.
+- `glm_blend` fits the likelihood member fold by fold and reports its gain on the out-of-fold blend. On all of `train.csv` (the full GPU run, about 4 h), scoring the 20% of passages the blend most suspects of being GLM and adding the member at weight 2 raises the blend from 0.6531 to 0.6831 (+0.030, 95% prompt-bootstrap interval +0.023 to +0.037). Almost all of the gain is on the two GLM labels: recall goes from 0.30 to 0.61 for glm-5.3 and from 0.44 to 0.65 for glm-5.3-flash.
+- `--glm-cover 0.2` on `kaggle_notebook` adds that member to the submission notebook ([glm_member.py](name_that_llm/glm_member.py) is shared by both). After the blend, the notebook scores up to 20% of the test passages under both models, as many as fit before 8.5 h (about 25 min plus 5 s per passage). It writes the blend without the member first, so a failed or late GLM stage in the hidden-test rerun still leaves a submission. Interactive runs also score 8 train passages again and check them against the stored features. That check showed GLM-5.3's scores (not Flash's) move with the passages batched alongside: the same 8 passages, one batch position later, gave per-token log-probs about 0.2 nats apart and mean log-probs within ±0.08 (about 13% of a feature's spread), while the same batches reproduce bit for bit. The train features carry the same noise (train.csv is shuffled), and adding a fresh draw of it to the held-out features leaves the gain at +0.029. `--push-dir` takes a pulled copy of the Kaggle notebook (`kaggle kernels pull <id> -p <dir> -m`) and adds the segment datasets, the binary notebook and the train-features notebook to its inputs:
+
+```bash
+uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=0.25 --lora lora_out_8b_full=0.5 --lora lora_out_mistral7b_full=0.5 --lora lora_out_14b_full=1.0 --t-svm 2.0 --glm-cover 0.2 --path notebooks/kaggle_submission_lora_4bfull_8bfull_mistral7bfull_14bfull_glm.ipynb --push-dir <pulled notebook dir>
+```
+
+- `--glm-prefix user-turn` switches both GLM models to the user-turn prompt of José Padilla's later notebook ([0.716 | Robust GLM-5.3 Likelihood + User Prefix](https://www.kaggle.com/code/estopadilla/0-716-robust-glm-5-3-likelihood-user-prefix), prvsiyan's idea). Before each passage the models see a request for one paragraph of about as many words as the passage has, under `Reasoning Effort: Low`; `run_pipeline.py` builds that per-passage prefix with his `user_prefix_tokens`. The train features are the outputs of his `ntl-glm-prefix-ab` notebook (versions 1 and 2 cover all 2,699 passages), merged into the private dataset `ntl-glm-userturn-train-features`. On our out-of-fold blend they raise the score from 0.6831 to 0.6916 at the same cover and weight (+0.0087, paired prompt-bootstrap 95% interval +0.002 to +0.016), with glm-5.3 recall 0.61 → 0.69 and glm-5.3-flash 0.65 → 0.75 (claude-fable-5 dips 0.47 → 0.44). In the Kaggle commit, 8 train passages scored again matched his features (Flash mean log-prob within 0.004).
+
+```bash
+uv run python -m name_that_llm.modeling.glm_blend data/interim/glm_ll_prefixb --tag glm_prefixb
+uv run python -m name_that_llm.kaggle_notebook --lora lora_out_4b_full=0.25 --lora lora_out_8b_full=0.5 --lora lora_out_mistral7b_full=0.5 --lora lora_out_14b_full=1.0 --t-svm 2.0 --glm-cover 0.2 --glm-prefix user-turn --path notebooks/kaggle_submission_lora_4bfull_8bfull_mistral7bfull_14bfull_glm_userturn.ipynb --push-dir <pulled notebook dir>
+```
 
 Each training run writes held-out logits. Compare and blend them with:
 

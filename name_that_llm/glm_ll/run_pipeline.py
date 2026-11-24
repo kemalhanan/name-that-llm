@@ -2,6 +2,9 @@
 #   Jose Padilla (estopadilla), "0.689 | Real GLM-5.3 Likelihood on 2xT4"
 #   https://www.kaggle.com/code/estopadilla/0-689-real-glm-5-3-likelihood-on-2xt4
 # as carried in lightningv08's "0.702 | Soft Typography + GLM + Qwen3.8-27B LoRA".
+# The per-text user-turn prefix (--user-template, user_prefix_tokens, _user_prefix_pieces) is copied
+# unchanged from the same author's run_pipeline.py in "0.716 | Robust GLM-5.3 Likelihood + User Prefix"
+#   https://www.kaggle.com/code/estopadilla/0-716-robust-glm-5-3-likelihood-user-prefix
 # It drives the author's `ntl-segrun` binary (a llama.cpp patch) over layer-segment GGUFs.
 # ruff: noqa
 """Score text likelihood by streaming each model segment once per state chunk."""
@@ -140,8 +143,71 @@ def main():
     ap.add_argument('--ubatch-div', type=int, default=1, help='n_ubatch = n_batch / P (pipeline parallel on 2 GPUs)')
     ap.add_argument('--prefetch', action='store_true', help='read the next segment while the current one computes')
     ap.add_argument('--prefetch-after', default='', help='with --prefetch: file to read during the last segment')
+    ap.add_argument('--user-template', default='Write a single paragraph of about {n_words} words, with no title or headings.',
+                    help="with '{user}' in --prefix: the user turn of each text ({n_words} = its word count)")
     a = ap.parse_args()
     main_run(a)
+
+
+def user_prefix_tokens(a, segrun, tok_model, texts, tx, tk, log):
+    """A prefix with a user turn that depends on the text: --prefix holds '{user}', replaced for each text by
+    --user-template formatted with n_words (the text's word count), e.g. prvsiyan's GLM prefix
+    '[gMASK]<sop><|system|>Reasoning Effort: Low<|user|>{user}<|assistant|><think></think>'.
+    ntl-segrun tokenize takes one prefix for all texts, so the tokens are put together from two calls (exact: the
+    special tokens split the string before BPE, so each plain-text piece is tokenized on its own):
+      full = tokenize(texts, prefix with an empty user turn) = H + T + text   (H = up to '{user}', T = the rest)
+      user = tokenize(user turns, prefix H)                    = H + U_i
+    and each text gets H + U_i + T + text, with n_prefix = len(H + U_i + T). Checked on the first 3 texts
+    against a tokenization with their whole prefix; if that check fails (a tokenizer where the pieces are not
+    independent), the exact fallback tokenizes each group of texts that share the user turn with its whole prefix."""
+    users = [a.user_template.format(n_words=len(t.split())) for t in texts]
+    try:
+        return _user_prefix_pieces(a, segrun, tok_model, texts, users, tx, tk, log)
+    except AssertionError as e:
+        # exact fallback: one tokenize call per distinct user turn (texts with the same word count share it)
+        print(f'[{a.tag}] user-turn prefix: piecewise tokens rejected ({e}); tokenizing by groups', flush=True)
+    groups = {}
+    for i, u in enumerate(users):
+        groups.setdefault(u, []).append(i)
+    seqs = [None] * len(texts)
+    for j, (u, idx) in enumerate(groups.items()):
+        gx, gk = tk + f'.g{j}.bin', tk + f'.g{j}_tok.bin'
+        segio.write_texts(gx, [texts[i] for i in idx])
+        run([segrun, 'tokenize', '--model', tok_model, '--texts', gx, '--out', gk, '--prefix', a.prefix.replace('{user}', u),
+             '--max-text-tokens', str(a.max_text_tokens)], log)
+        for i, sq in zip(idx, segio.read_tokens(gk)):
+            seqs[i] = sq
+        os.remove(gx); os.remove(gk)
+    print(f'[{a.tag}] user-turn prefix: {len(groups)} groups, prefix {min(s[1] for s in seqs)}-{max(s[1] for s in seqs)} '
+          f'tokens; e.g. {users[0]!r}', flush=True)
+    return seqs
+
+
+def _user_prefix_pieces(a, segrun, tok_model, texts, users, tx, tk, log):
+    head = a.prefix.split('{user}')[0]
+    run([segrun, 'tokenize', '--model', tok_model, '--texts', tx, '--out', tk, '--prefix', a.prefix.replace('{user}', ''),
+         '--max-text-tokens', str(a.max_text_tokens)], log)
+    full = segio.read_tokens(tk)
+    ux, uk = tk + '.user_texts.bin', tk + '.user_tok.bin'
+    segio.write_texts(ux, users)
+    run([segrun, 'tokenize', '--model', tok_model, '--texts', ux, '--out', uk, '--prefix', head,
+         '--max-text-tokens', '100000'], log)
+    user = segio.read_tokens(uk)
+    n_h = user[0][1]
+    seqs = []
+    for (f_ids, f_pre), (u_ids, u_pre) in zip(full, user):
+        assert u_pre == n_h and f_pre >= n_h and list(f_ids[:n_h]) == list(u_ids[:n_h]), 'prefix head differs'
+        seqs.append((np.concatenate([u_ids, f_ids[n_h:]]).astype('<i4'), len(u_ids) + f_pre - n_h))
+    for i in range(min(3, len(texts))):
+        one_x, one_k = tk + f'.check{i}.bin', tk + f'.check{i}_tok.bin'
+        segio.write_texts(one_x, [texts[i]])
+        run([segrun, 'tokenize', '--model', tok_model, '--texts', one_x, '--out', one_k,
+             '--prefix', a.prefix.replace('{user}', users[i]), '--max-text-tokens', str(a.max_text_tokens)], log)
+        ids, pre = segio.read_tokens(one_k)[0]
+        assert pre == seqs[i][1] and list(ids) == list(seqs[i][0]), f'user-prefix tokens differ for text {i}'
+    print(f'[{a.tag}] user-turn prefix: head {n_h} tokens, prefix {min(s[1] for s in seqs)}-{max(s[1] for s in seqs)} '
+          f'tokens (pieces checked on {min(3, len(texts))} texts); e.g. {users[0]!r}', flush=True)
+    return seqs
 
 
 def main_run(a):
@@ -169,9 +235,12 @@ def main_run(a):
     tx = os.path.join(a.work, f'{a.tag}_texts.bin')
     tk = os.path.join(a.work, f'{a.tag}_tok.bin')
     segio.write_texts(tx, texts)
-    run([segrun, 'tokenize', '--model', segs[0], '--texts', tx, '--out', tk, '--prefix', a.prefix,
-         '--max-text-tokens', str(a.max_text_tokens)], log)
-    seqs = segio.read_tokens(tk)
+    if '{user}' in a.prefix:
+        seqs = user_prefix_tokens(a, segrun, segs[0], texts, tx, tk, log)
+    else:
+        run([segrun, 'tokenize', '--model', segs[0], '--texts', tx, '--out', tk, '--prefix', a.prefix,
+             '--max-text-tokens', str(a.max_text_tokens)], log)
+        seqs = segio.read_tokens(tk)
     n_rows = np.array([len(ids) for ids, _ in seqs])
     # processing order: longest first when packing (similar lengths share a decode, little padding)
     order = np.argsort(-n_rows, kind='stable') if a.pack else np.arange(len(seqs))
