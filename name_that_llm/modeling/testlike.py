@@ -21,6 +21,8 @@ from CHEN Han's published out-of-fold logits (``native_blend``), calibrated on e
     uv run python -m name_that_llm.modeling.testlike fit
     uv run python -m name_that_llm.modeling.testlike tune
     uv run python -m name_that_llm.modeling.testlike joint
+    uv run python -m name_that_llm.modeling.testlike share
+    uv run python -m name_that_llm.modeling.testlike perlora
 """
 
 from dataclasses import dataclass, replace
@@ -61,12 +63,14 @@ class Config:
     glm_cover: float = 0.2
     glm_w: float = 2.0
     sinkhorn: float = 0.3
+    share: float = 0.0  # > 0: mix the expert as a fixed share, (1 - s) * blend + s * expert, as the 0.716 notebook does
 
 
 V7 = Config(native_w=0.0)
 V10 = Config()
 V9 = replace(V10, centre_f=0.5)
 V8 = replace(V9, assign=True)
+V11 = replace(V10, lora=tuple(0.3 * np.asarray(V10.lora)), sinkhorn=0.15, glm_w=3.0)
 
 
 class Parts:
@@ -116,7 +120,10 @@ class Parts:
     def predict(self, rows, groups, nat, c: Config):
         lp = log_softmax(self.svm[rows] * c.t_svm) + np.tensordot(np.asarray(c.lora), self.lora[:, rows], 1)
         lp = centre(lp, groups, c.centre_f) if c.centre_f else lp
-        lp = lp + c.native_w * nat[c.native_cent]
+        if c.share:
+            lp = (1 - c.share) * log_softmax(lp) + c.share * nat[c.native_cent]
+        else:
+            lp = lp + c.native_w * nat[c.native_cent]
         sc = self.scored[rows]
         sel = np.argsort(-np.where(sc, glm_mass(lp, self.labels), -1.0), kind="stable")[: round(c.glm_cover * len(rows))]
         sel = sel[sc[sel]]
@@ -241,6 +248,96 @@ def joint(top: int = 4, draws: int = 60, seed: int = 2, fit_tag: str = "testlike
                              delta=round(d[:, j].mean(), 4), se=round(d[:, j].std() / np.sqrt(nd), 4)))
         print(st, "done", flush=True)
     (REPORTS_DIR / f"{tag}.json").write_text(json.dumps({"draws": draws, "rows": rows}, indent=1))
+
+
+def cache(parts, structure, draws, seed):
+    """The draws of ``structure`` with their expert outputs, so many configs can be scored on the same draws."""
+    rng = np.random.default_rng(seed)
+    nd = 1 if structure.base >= 1 and structure.sigma == 0 else draws  # all of train.csv: one deterministic draw
+    out = []
+    for _ in range(nd):
+        rows, groups = structure.draw(parts, rng)
+        out.append((rows, groups, {u: parts.native(rows, groups, u) for u in (True, False)}))
+    return out
+
+
+def score(parts, cached, configs):
+    """Balanced accuracy of each config on each cached draw: an array (draws, configs)."""
+    return np.array([[balanced_accuracy(parts.y[r], parts.predict(r, g, nat, c), parts.k) for c in configs]
+                     for r, g, nat in cached])
+
+
+def chosen_structures(top, fit_tag="testlike_fit"):
+    fits = pd.DataFrame(json.loads((REPORTS_DIR / f"{fit_tag}.json").read_text())["rows"]).sort_values("miss")
+    return [Structure(r.base, r.sigma, r.grouping) for r in fits.head(top).itertuples()] + [Structure(1.0, 0.0, "tfidf")]
+
+
+def table(parts, structures, caches, names, configs, base=0):
+    rows = []
+    for st, cached in zip(structures, caches):
+        r = score(parts, cached, configs)
+        d = r - r[:, base : base + 1]
+        for j, n in enumerate(names):
+            rows.append(dict(structure=f"{st.base}/{st.sigma}/{st.grouping}", config=n, bal_acc=round(r[:, j].mean(), 4),
+                             delta=round(d[:, j].mean(), 4), se=round(d[:, j].std() / np.sqrt(len(cached)), 4)))
+    return pd.DataFrame(rows)
+
+
+@app.command()
+def share(top: int = 4, draws: int = 60, seed: int = 4, tag: str = "testlike_share"):
+    """The expert as a fixed share of the blend (the 0.716 notebook's way) against v11's added weight."""
+    parts = Parts()
+    structures = chosen_structures(top)
+    caches = [cache(parts, st, draws, seed) for st in structures]
+    print("draws cached", flush=True)
+    base = np.asarray(V10.lora)
+    grid = [("v11", V11), ("v10", V10)]
+    for s_, scale, gw, sk in itertools.product((0.2, 0.3, 0.4, 0.5, 0.6), (0.3, 0.6, 1.0), (1.0, 2.0, 3.0), (0.15, 0.3)):
+        grid.append((f"share {s_} lora x{scale} glm_w {gw} sk {sk}",
+                     replace(V11, share=s_, lora=tuple(base * scale), glm_w=gw, sinkhorn=sk)))
+    names, configs = zip(*grid)
+    t = table(parts, structures, caches, names, configs)
+    piv = t.pivot_table(index="config", columns="structure", values="delta", sort=False)
+    piv["mean_testlike"] = piv[[c for c in piv.columns if not c.startswith("1.0/")]].mean(1)
+    print(piv.sort_values("mean_testlike", ascending=False).head(25).round(4).to_string())
+    (REPORTS_DIR / f"{tag}.json").write_text(json.dumps({"draws": draws, "seed": seed, "rows": t.to_dict("records")}, indent=1))
+
+
+@app.command()
+def perlora(top: int = 4, draws: int = 40, seed: int = 5, check_draws: int = 60, check_seed: int = 6,
+            passes: int = 2, tag: str = "testlike_perlora"):
+    """Each LoRA's weight fitted on its own (coordinate search from v11), then checked on fresh draws."""
+    parts = Parts()
+    structures = chosen_structures(top)
+    fit_caches = [cache(parts, st, draws, seed) for st in structures[:-1]]  # fit on test-like draws only
+    print("fit draws cached", flush=True)
+
+    def objective(ws):
+        cs = [V11] + [replace(V11, lora=tuple(w)) for w in ws]
+        r = [score(parts, c, cs) for c in fit_caches]
+        return np.mean([x[:, 1:].mean(0) - x[:, 0].mean() for x in r], axis=0)
+
+    w = np.asarray(V11.lora, float)
+    path = []
+    for p_ in range(passes):
+        for i, m in enumerate(MEMBERS):
+            cands = []
+            for f in (0.0, 0.5, 0.75, 1.0, 1.5, 2.0):
+                v = w.copy()
+                v[i] = w[i] * f if w[i] else 0.05 * f
+                cands.append(v)
+            gains = objective(cands)
+            j = int(np.argmax(gains))
+            w = cands[j]
+            path.append(dict(step=f"pass {p_} {m}", weights=[round(x, 4) for x in w], fit_gain=round(float(gains[j]), 4)))
+            print(path[-1], flush=True)
+    check = [cache(parts, st, check_draws, check_seed) for st in structures]
+    names = ["v11", "per-lora", "halfway"]
+    configs = [V11, replace(V11, lora=tuple(w)), replace(V11, lora=tuple((w + np.asarray(V11.lora)) / 2))]
+    t = table(parts, structures, check, names, configs)
+    print(t.pivot_table(index="config", columns="structure", values="delta", sort=False).round(4).to_string())
+    (REPORTS_DIR / f"{tag}.json").write_text(json.dumps({"members": list(MEMBERS), "path": path, "final": [round(x, 4) for x in w],
+                                                         "check": t.to_dict("records")}, indent=1))
 
 
 if __name__ == "__main__":

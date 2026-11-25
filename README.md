@@ -41,6 +41,10 @@ All cross-validation is `GroupKFold(5)` by `prompt_id`. Every model answered eve
 | + TF-IDF prompt groups, CHEN Han's Qwen3-Embedding-8B expert and one model per passage within each group (OOF 0.8495) | 0.663 |
 | the same without one model per passage within each group (OOF 0.7391) | 0.684 |
 | **the same without centring the blend within each group (OOF 0.7217)** | **0.690** |
+| the same re-weighted on a test-like validation: LoRA weights ×0.3, Sinkhorn 0.15, GLM weight 3 | 0.689 |
+| the same with the 8B LoRA on its own base (since v8 it had loaded Qwen3-Embedding-8B) | 0.687 |
+
+The GLM-5.3 features computed at test time drift from the stored train features: its sparse attention depends on which passages share a batch. Simulated on the out-of-fold blend, the drift costs at most about 0.002 ([reports/glm_drift_sim.csv](reports/glm_drift_sim.csv)), so the member is left as it is.
 
 The final blend scores 0.6831 balanced accuracy out-of-fold, 0.6531 without the GLM member (0.6361 without the 14B as well, 0.6305 without the Mistral-7B too). The best single model is the 5-fold 14B LoRA at 0.630; the 8B scores 0.615, the 4B 0.597 and the Mistral-7B 0.595. Per-run metrics are in [reports/](reports/).
 
