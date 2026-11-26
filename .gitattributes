@@ -1,0 +1,2 @@
+# third-party patch and scripts run on Linux (git apply, bash): keep LF
+name_that_llm/glm_ll/segrun/** text eol=lf
